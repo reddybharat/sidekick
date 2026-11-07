@@ -1,3 +1,4 @@
+import httpx
 from langchain_ollama import OllamaEmbeddings
 
 # Qwen3-Embedding expects an instruction on the query side only; chunks are embedded as-is.
@@ -28,3 +29,8 @@ class OllamaEmbedder:
 
     async def embed_query(self, text: str) -> list[float]:
         return await self._client.aembed_query(f"Instruct: {QUERY_INSTRUCTION}\nQuery: {text}")
+
+
+async def ping(client: httpx.AsyncClient) -> None:
+    response = await client.get("/api/version")
+    response.raise_for_status()

@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.deps import ContainerDep
 from app.infra.db import engine as db
-from app.infra.llm import ollama
+from app.infra.embeddings import ollama
 
 log = structlog.get_logger()
 router = APIRouter(tags=["health"])
