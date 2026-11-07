@@ -1,5 +1,7 @@
 // Hand-written mirror of the backend schemas (backend/app/api/schemas, domain/models.py).
 // shortcut: no codegen (openapi-typescript needs TypeScript 5); generate types if the API grows.
+import type { Turn } from '@/components/Chat'
+
 const API_URL: string = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 
 export interface Session {
@@ -25,6 +27,7 @@ export interface LibraryDocument {
   status: DocumentStatus
   error: string | null
   created_at: string
+  has_file: boolean
 }
 
 export type ChatEvent =
@@ -36,15 +39,21 @@ export type ChatEvent =
 
 export class ApiError extends Error {}
 
+/** The backend's `{"error": {code, message}}` message (core/errors.py), else the status. */
+function errorMessage(status: number, body: unknown): string {
+  const message = (body as { error?: { message?: unknown } } | null)?.error?.message
+  return typeof message === 'string' ? message : `Request failed (${status})`
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_URL}${path}`, init)
-  if (!res.ok) {
-    const body = (await res.json().catch(() => null)) as { detail?: unknown } | null
-    throw new ApiError(
-      typeof body?.detail === 'string' ? body.detail : `Request failed (${res.status})`,
-    )
-  }
+  if (!res.ok) throw new ApiError(errorMessage(res.status, await res.json().catch(() => null)))
   return res.status === 204 ? (undefined as T) : ((await res.json()) as T)
+}
+
+/** The stored original PDF, opened by the browser's viewer at `page`. */
+export function documentFileUrl(id: string, page: number): string {
+  return `${API_URL}/documents/${id}/file#page=${page}`
 }
 
 const json = (method: string, body: unknown): RequestInit => ({
@@ -59,14 +68,28 @@ export const api = {
   renameSession: (id: string, title: string) =>
     request<Session>(`/sessions/${id}`, json('PATCH', { title })),
   deleteSession: (id: string) => request<void>(`/sessions/${id}`, { method: 'DELETE' }),
+  listTurns: (id: string) => request<Turn[]>(`/sessions/${id}/messages`),
   // The first model is the backend's default.
   listModels: () => request<ModelInfo[]>('/models'),
   listDocuments: () => request<LibraryDocument[]>('/documents'),
-  uploadDocument: (file: File) => {
-    const form = new FormData()
-    form.append('file', file)
-    return request<LibraryDocument>('/documents', { method: 'POST', body: form })
-  },
+  // XMLHttpRequest, because fetch reports no upload progress.
+  uploadDocument: (file: File, onProgress: (fraction: number) => void) =>
+    new Promise<LibraryDocument>((resolve, reject) => {
+      const xhr = new XMLHttpRequest()
+      xhr.open('POST', `${API_URL}/documents`)
+      xhr.responseType = 'json'
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onProgress(e.loaded / e.total)
+      }
+      xhr.onload = () =>
+        xhr.status >= 200 && xhr.status < 300
+          ? resolve(xhr.response as LibraryDocument)
+          : reject(new ApiError(errorMessage(xhr.status, xhr.response)))
+      xhr.onerror = () => reject(new ApiError('Network error'))
+      const form = new FormData()
+      form.append('file', file)
+      xhr.send(form)
+    }),
   deleteDocument: (id: string) => request<void>(`/documents/${id}`, { method: 'DELETE' }),
 }
 
@@ -80,7 +103,8 @@ export async function* streamMessage(
     `${API_URL}/sessions/${sessionId}/messages`,
     json('POST', { text, model_id: modelId }),
   )
-  if (!res.ok || !res.body) throw new ApiError(`Request failed (${res.status})`)
+  if (!res.ok || !res.body)
+    throw new ApiError(errorMessage(res.status, await res.json().catch(() => null)))
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader()
   let buffer = ''
   for (;;) {

@@ -1,6 +1,6 @@
 ---
 name: retrieving-from-documents
-description: Read before answering any question, unless it is a greeting or small talk, since the answer is probably in the user's documents. Use for facts, numbers, definitions, explanations and summaries. Unlocks retrieve_from_documents, which searches the document library and returns passages with page numbers.
+description: Searches the PDFs the user has uploaded to their library and retrieves the passages that answer a question. Covers anything the documents contain, such as facts, figures, definitions, explanations, procedures and summaries. Returns passages with filename and page number, for citing as (filename, p. N).
 allowed-tools: retrieve_from_documents
 ---
 # Retrieving from documents
@@ -10,7 +10,7 @@ allowed-tools: retrieve_from_documents
 
 ## How to search
 1. Always search before answering, even if the topic seems general or familiar.
-2. Query with the question's key terms, not the whole sentence.
+2. Query with the question's key terms, not the whole sentence. Replace references to earlier turns with their names ("it" → "phase two budget").
 3. If the passages don't answer it, search once more with different words (synonyms, the likely section name).
 
 ## How to answer

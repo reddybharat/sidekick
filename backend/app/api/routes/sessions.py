@@ -2,7 +2,7 @@ import uuid
 
 from fastapi import APIRouter, status
 
-from app.api.deps import SessionDep, SessionServiceDep
+from app.api.deps import ChatServiceDep, SessionDep, SessionServiceDep
 from app.api.schemas.sessions import SessionCreate, SessionOut, SessionUpdate
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
@@ -31,5 +31,9 @@ async def rename_session(
 
 
 @router.delete("/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_session(session_id: uuid.UUID, sessions: SessionServiceDep) -> None:
-    await sessions.delete(session_id)
+async def delete_session(
+    session: SessionDep, sessions: SessionServiceDep, chat: ChatServiceDep
+) -> None:
+    # History first: if it fails the session stays and the delete can be retried, with no orphans.
+    await chat.delete_history(session)
+    await sessions.delete(session.id)

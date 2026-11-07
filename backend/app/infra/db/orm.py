@@ -2,8 +2,8 @@ import uuid
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, ForeignKey, String, Text, func
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy import DateTime, ForeignKey, LargeBinary, String, Text, exists, func
+from sqlalchemy.orm import DeclarativeBase, Mapped, column_property, mapped_column
 
 
 class Base(DeclarativeBase):
@@ -36,6 +36,17 @@ class TurnUsageRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class DocumentFileRow(Base):
+    """The original PDF, in its own table so document lists and searches never load the bytes."""
+
+    __tablename__ = "document_files"
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), primary_key=True
+    )
+    data: Mapped[bytes] = mapped_column(LargeBinary)
+
+
 class DocumentRow(Base):
     __tablename__ = "documents"
 
@@ -48,6 +59,9 @@ class DocumentRow(Base):
     status: Mapped[str] = mapped_column(String(16))
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    has_file: Mapped[bool] = column_property(
+        exists().where(DocumentFileRow.document_id == id).correlate_except(DocumentFileRow)
+    )
 
 
 class ChunkRow(Base):

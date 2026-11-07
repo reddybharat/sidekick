@@ -22,3 +22,13 @@ class Settings(BaseSettings):
     embedding_dim: int = 1024
     max_upload_bytes: int = 20 * 1024 * 1024
     cors_origins: list[str] = ["http://localhost:5173"]
+    history_max_turns: int = 5
+    # Server name -> streamable-HTTP URL; env MCP_SERVERS as JSON. Every server must be up at start.
+    mcp_servers: dict[str, str] = {}
+    mcp_api_key: str | None = None
+    mcp_timeout_s: float = 30.0
+
+    @property
+    def checkpoint_database_url(self) -> str:
+        """The same database for the psycopg-based checkpointer (the app itself uses asyncpg)."""
+        return self.database_url.replace("+asyncpg", "", 1)

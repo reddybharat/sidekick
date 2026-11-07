@@ -24,6 +24,7 @@ Paths are relative to `backend/` unless they start with `frontend/`.
 | `GROQ_API_KEY` | empty | enables the Groq models in the catalog; without it they are skipped |
 | `LOG_LEVEL` / `LOG_JSON` | `INFO` / `true` | logging (`.env.example` sets `LOG_JSON=false`) |
 | `DEFAULT_OWNER_ID` | `local` | owner of every session and document until auth exists |
+| `HISTORY_MAX_TURNS` | `5` | earlier question/answer pairs the model sees (`ConversationView`) |
 | `READINESS_TIMEOUT_S` | `2.0` | per-check timeout in `/ready` |
 | `MODELS_CONFIG_PATH` | `config/models.yaml` | chat model catalog |
 | `LLM_TIMEOUT_S` | `120.0` | HTTP timeout for chat (Gemini and Groq) and embedding calls |
@@ -31,6 +32,9 @@ Paths are relative to `backend/` unless they start with `frontend/`.
 | `EMBEDDING_DIM` | `1024` | vector size; **must equal** the `vector(1024)` column from migration `0003` |
 | `MAX_UPLOAD_BYTES` | `20971520` (20 MiB) | upload size limit |
 | `CORS_ORIGINS` | `["http://localhost:5173"]` | browser origins allowed to call the API (JSON list) |
+| `MCP_SERVERS` | `{}` (startup then fails: the web and weather skills name tools no server provides) | MCP servers as a JSON map of name → streamable-HTTP URL; `.env.example` sets `search` and `weather` on custom-mcp-server (port 8001) |
+| `MCP_API_KEY` | unset | sent as `X-API-Key` to every MCP server; must equal custom-mcp-server's `MCP_API_KEY` |
+| `MCP_TIMEOUT_S` | `30.0` | MCP tool discovery at startup and each MCP tool call |
 
 The frontend reads `VITE_API_URL` (default `http://localhost:8000`) from `frontend/.env`.
 
@@ -38,8 +42,11 @@ The frontend reads `VITE_API_URL` (default `http://localhost:8000`) from `fronte
 
 | Command (in `backend/`) | Needs | Covers |
 |---|---|---|
-| `uv run pytest tests/unit -q` | nothing | skill loader, progressive disclosure, chunker, model factory |
-| `uv run pytest -rs` | Postgres (`TEST_DATABASE_URL`) + Ollama; skips with a reason otherwise | everything: health/ready, models, sessions, documents + chat, logging, migrations |
+| `uv run pytest tests/unit -q` | nothing | skill loader, agent builder checks, progressive disclosure, conversation view, chunker, model factory |
+| `uv run pytest -rs` | Postgres (`TEST_DATABASE_URL`) + Ollama + custom-mcp-server (`MCP_SERVERS`); skips with a reason otherwise | everything: health/ready, models, sessions, documents + chat, logging, migrations, MCP tools |
+| `uv run pytest -rs tests/unit tests/integration/test_mcp.py` | custom-mcp-server for the live MCP test | unit tests plus MCP tool loading |
+
+Every integration test that starts the app (`create_app` in a `TestClient`) uses the `mcp_servers` fixture (`tests/conftest.py`), because the app does not start without its MCP servers. It skips when `MCP_SERVERS` is unset or a server does not answer HTTP.
 
 ### 1.3 Check by hand
 
@@ -52,7 +59,7 @@ $s = (Invoke-RestMethod -Method Post http://localhost:8000/sessions -ContentType
 curl.exe -N -X POST http://localhost:8000/sessions/$s/messages -H "Content-Type: application/json" -d '{\"text\":\"What is the phase two budget?\"}'
 ```
 
-Expect `tool_start`/`tool_end` for `read_skill_file`, then for `retrieve_from_documents`, then `token`… and `done`, with a citation like `(sample.pdf, p. 3)`. Uploading the same file again returns 409; `curl.exe -X DELETE http://localhost:8000/documents/<id>` removes it. Interactive API docs: http://localhost:8000/docs.
+Expect `tool_start`/`tool_end` for `read_skill_file`, then for `retrieve_from_documents`, then `token`… and `done`, with a citation like `(sample.pdf, p. 3)`. "What's the latest Python release?" should read `searching-the-web/SKILL.md` and call `web_search` (answer cites `[title](url)`); "Weather in Hyderabad?" should read `checking-the-weather/SKILL.md` and call `get_weather`. Uploading the same file again returns 409 (a `failed` copy is replaced instead); `curl.exe -I http://localhost:8000/documents/<id>/file` gives `200` with `application/pdf` (the stored original); `curl.exe -X DELETE http://localhost:8000/documents/<id>` removes it. Interactive API docs: http://localhost:8000/docs.
 
 Inspect the database with `psql -U app -d agentic_rag`:
 
@@ -73,8 +80,10 @@ SELECT model_id, input_tokens, output_tokens, latency_ms FROM turn_usage ORDER B
 3. The lifespan runs `container.py: Container.build` once. It is the only place concrete classes are created:
 
 ```text
+load_mcp_tools(MCP_SERVERS, MCP_API_KEY, MCP_TIMEOUT_S)   # first: a down server fails startup before any pool opens
 engine (SQLAlchemy async, asyncpg, pool_pre_ping)
  └─ uow = SqlUnitOfWork factory              one DB transaction per `async with uow()`
+psycopg AsyncConnectionPool → AsyncPostgresSaver(pool).setup()   # history; creates its own tables
 ModelFactory.from_yaml(config/models.yaml, {"gemini": GeminiChatProvider,   # only with GOOGLE_API_KEY
                                             "groq": GroqChatProvider})       # only with GROQ_API_KEY
 SessionService(uow, owner)
@@ -83,11 +92,18 @@ DocumentService(uow, owner, embedder, load_pdf_pages, split_words, MAX_UPLOAD_BY
 build_agent(model_factory.model(id),   # one agent per catalog model
             prompts/system.md,                  base system prompt
             load_skills(),                      agent/skills/
-            [make_retrieve_from_documents(documents.search)])
-ChatService(uow, {model id: agent}, sessions)
+            [make_retrieve_from_documents(documents.search), *mcp_tools],
+            the saver, HISTORY_MAX_TURNS)
+ChatService(uow, {model id: agent}, sessions, the saver)
 ```
 
-Startup fails fast on a malformed skill file, or an unknown tool in `allowed-tools`. Routes get services through `api/deps.py` (`request.app.state.container`).
+`Container.build` is async: it opens the pool and runs the saver's idempotent `setup()` (the checkpoint tables belong to the saver, not Alembic). `Container.aclose` closes the pool.
+
+4. The lifespan then calls `DocumentService.fail_interrupted`: ingestion runs in the API process, so a document still `pending` at startup was cut off by a restart. Every owner's `pending` rows become `failed` with `INTERRUPTED_MESSAGE` ("Processing was interrupted by a server restart. Upload the file again.") and `ingestion_interrupted` logs how many. This assumes one API process (a `shortcut:` in `main.py`).
+
+Windows: psycopg's async mode cannot run on the default Proactor event loop, so `main.py` switches to the selector policy (tests and scripts). `uvicorn --reload` already uses the selector loop; plain `uvicorn` without `--reload` ignores the policy and would hang on startup.
+
+Startup fails fast on an unreachable MCP server or one that lists no tools (`mcp_server_unavailable`), a malformed skill file, a `system.md` without `{skills}`, duplicate tool names, or an unknown tool in `allowed-tools`. Routes get services through `api/deps.py` (`request.app.state.container`).
 
 ---
 
@@ -96,13 +112,21 @@ Startup fails fast on a malformed skill file, or an unknown tool in `allowed-too
 `POST /sessions/{id}/messages {"text": "...", "model_id": "..."}` (`text` 1–8000 characters after trimming, otherwise 422; `model_id` optional, default = the catalog's first model, an id not in the catalog gives 422 `unknown_model` before the stream starts).
 
 1. The `get_session` dependency loads the session with the owner filter. An unknown session gives 404 **before** the stream starts.
-2. `services/chat.py: ChatService.stream` calls `agent.astream({"messages": [HumanMessage(text)]}, stream_mode=["messages", "updates"], context=AgentContext(owner_id))`.
+2. `services/chat.py: ChatService.stream` counts the earlier turns (`prior_turns`, logged in `turn_started`), then calls `agent.astream({"messages": [HumanMessage(text)]}, {"configurable": {"thread_id": session_id}}, stream_mode=["messages", "updates"], context=AgentContext(owner_id))`. The checkpointer appends the new message to the session's saved messages.
 3. The agent loops: model call → tool calls → model call … until an answer or 8 tool calls.
 4. Stream mapping:
    - `messages` mode → `AIMessageChunk`s → one `token` event per non-empty `.text` (thinking never appears in `.text`). `usage_metadata` is summed over all model calls.
    - `updates` mode → an `AIMessage` with `tool_calls` gives a `tool_start` per call; a `ToolMessage` gives `tool_end` (`ok = status != "error"`).
-5. An exception during the stream → logged with traceback → one `error` event (`chat_failed`); no usage is saved.
+5. An exception during the stream → logged with traceback → the error text is saved as the turn's reply (an `AIMessage` with `additional_kwargs["error_code"]`, written with `aupdate_state(as_node="model")`; if that fails, `history_error_save_failed` is logged) → one `error` event (`chat_failed`); no usage is saved. A client disconnect saves nothing.
 6. On success: insert `turn_usage` → `SessionService.title_from_message` (only while the title is `New chat`: the first message with whitespace collapsed, cut to `SESSION_TITLE_CHARS = 60` with a trailing `…`; no model call) → `done`.
+
+**One turn at a time per session.** Steps 2–6 run while `ChatService.stream` holds the session's `asyncio.Lock` (`ChatService._busy`, a `WeakValueDictionary` keyed by session id, so an entry lives only while a stream holds it). A send to a session whose lock is held logs `turn_rejected` (WARNING, `reason=session_busy`) and gets exactly one `error` event, `session_busy`: "This chat is answering in another tab. Wait for it to finish, then send again." Nothing is saved. The lock is released when the stream ends, fails or the client disconnects. It is per process (a `shortcut:` in `ChatService.__init__`).
+
+### 3.1 History
+
+- `GET /sessions/{id}/messages` → `ChatService.history`: reads the session's checkpoint (`aget_state`) and returns `[{id, role, text, tools: [{id, name, ok, args}], skills, error?}]`, oldest first. One user entry per `HumanMessage`; one assistant entry per turn with the concatenated answer text, every tool call (`ok` false when the call has no result), the skills read (from `read_skill_file` paths) and, for a failed turn, `error` instead of text. The session is resolved first (404 for another owner's). No passages are returned.
+- `DELETE /sessions/{id}`: owner check → `ChatService.delete_history` (`adelete_thread`; 409 `conflict` "This chat is still answering. Try again when it finishes." while the session's lock is held, because the stream would keep writing to the deleted thread) → delete the session row. History goes first so a failure leaves the session in place and the delete can be retried; nothing is orphaned.
+- The frontend loads these turns once per page load when a session is first opened (`App.tsx`); after that its tab state is current.
 
 ### SSE events
 
@@ -112,7 +136,7 @@ Startup fails fast on a malformed skill file, or an unknown tool in `allowed-too
 | `tool_end` | `{id, name, ok}` |
 | `token` | `{text}` |
 | `done` | `{input_tokens, output_tokens, latency_ms}` |
-| `error` | `{code, message}` |
+| `error` | `{code, message}`; `code` is `chat_failed` (the turn failed) or `session_busy` (another turn is streaming in this session) |
 
 Order: `tool_start`/`tool_end` and `token` interleaved, then exactly one `done` or `error`. `frontend/src/lib/api.ts: streamMessage` POSTs and parses the stream with `fetch` + `TextDecoderStream` (`EventSource` cannot POST); its API types are hand-written mirrors of the backend schemas.
 
@@ -159,9 +183,11 @@ POST /documents (multipart "file", one file per request)
   services/documents.py: DocumentService.upload
     1. len(data) > MAX_UPLOAD_BYTES       → 413 payload_too_large
     2. not data.startswith(b"%PDF-")      → 422 invalid_document
-    3. sha256 already in the library      → 409 conflict  (also unique on (owner_id, sha256))
-    4. insert documents row, status = pending
-  response 202 {id, filename, status: "pending", ...}
+    3. sha256 already in the library      → status failed: delete that row (same transaction)
+                                            otherwise 409 conflict  (unique on (owner_id, sha256))
+    4. insert documents row (status = pending) + document_files row (the original bytes),
+       one transaction
+  response 202 {id, filename, status: "pending", has_file: true, ...}
   background task: DocumentService.ingest(document_id, data)
     a. infra/rag/pdf_loader.py: load_pdf_pages   pypdf text per page (in a thread)
     b. infra/rag/chunkers.py: split_words         per page
@@ -171,7 +197,9 @@ POST /documents (multipart "file", one file per request)
     any exception                        → logged, status = failed, error = "Could not read this PDF."
 ```
 
-- `GET /documents` lists the library (poll for `pending → ready | failed`). `DELETE /documents/{id}` cascades to chunks (404 for unknown or another owner's).
+- `GET /documents` lists the library (poll for `pending → ready | failed`); each document has `has_file` (`orm.py: DocumentRow.has_file`, an `EXISTS` on `document_files` in every document select). `DELETE /documents/{id}` cascades to chunks and the stored file (404 for unknown or another owner's).
+- **Original PDF:** `document_files(document_id PK → documents ON DELETE CASCADE, data bytea)`, a separate table so lists and searches never load the bytes. `GET /documents/{id}/file` (`DocumentService.file`) returns it inline: `application/pdf`, `Content-Disposition: inline; filename*=UTF-8''<quoted name>`, `X-Content-Type-Options: nosniff`, so the browser's own viewer opens it and honours `#page=N`. 404 for an unknown id, another owner's document, or one uploaded before `0005` (no stored file, `has_file` false).
+- **Restart:** a `pending` document whose ingestion was cut off is marked `failed` at the next startup (section 2), and uploading the same PDF again replaces it (step 3).
 - **Chunking (`split_words`):** chunks never cross a page. Whitespace-split words are packed until the next word would exceed `CHUNK_CHARS = 1000`; the next chunk starts `OVERLAP_WORDS = 30` words back; whitespace is normalised; `ordinal` numbers chunks across the document.
 - pypdf flattens layout and tables; scanned pages give no text (no OCR).
 
@@ -183,30 +211,36 @@ POST /documents (multipart "file", one file per request)
 
 ```text
 create_agent(model,
-             tools=[read_skill_file, retrieve_from_documents],
-             system_prompt=catalog.system_prompt(system.md),     base prompt + skill index
-             middleware=[ProgressiveDisclosure(catalog),
+             tools=[read_skill_file, retrieve_from_documents, web_search, get_weather],
+             system_prompt=catalog.system_prompt(system.md),     skill index in place of {skills}
+             middleware=[ConversationView(HISTORY_MAX_TURNS),
+                         ProgressiveDisclosure(catalog),
                          ToolCallLimitMiddleware(run_limit=8, exit_behavior="continue")],
-             context_schema=AgentContext)
+             context_schema=AgentContext,
+             checkpointer=saver)
 ```
 
 - **Context:** `agent/state.py: AgentContext(owner_id)`, passed per run, readable by middleware and tools.
-- **State:** `messages` only, for one run: no checkpointer.
+- **State:** `messages`, checkpointed per session (`thread_id` = session id). The checkpoint keeps every message; `ConversationView` decides what the model sees (7.6).
 - After 8 tool calls, further calls get an error result and the model has to answer.
+- `build_agent` raises `ValueError` on duplicate tool names (an MCP tool would otherwise shadow another) and on a skill naming a tool that is not in the list.
 
 ### 7.1 System prompt
 
-`SkillCatalog.system_prompt(base)` = `prompts/system.md` + `## Skills` + `Available skills:` + one index line per skill (name, path, description, `allowed-tools`):
+`SkillCatalog.system_prompt(base)` replaces `SKILLS_PLACEHOLDER = "{skills}"` in `prompts/system.md` with one index line per skill (name, path, description, `allowed-tools`), using `str.replace` so other braces are safe. A prompt without the placeholder raises `ValueError` at startup.
 
 ```text
-<prompts/system.md>
+You are the user's personal chat assistant.
 
-## Skills
-Available skills:
-- retrieving-from-documents (`retrieving-from-documents/SKILL.md`): Read before answering any question, ... Tools: retrieve_from_documents
+You have these available skills in your arsenal:
+- checking-the-weather (`checking-the-weather/SKILL.md`): Gets the current weather ... Tools: get_weather
+- retrieving-from-documents (`retrieving-from-documents/SKILL.md`): Searches the PDFs ... Tools: retrieve_from_documents
+- searching-the-web (`searching-the-web/SKILL.md`): Searches the public web ... Tools: web_search
+
+- Choose skills from the list above by what they do. ...
 ```
 
-Skill bodies are never in the system prompt; they arrive as `read_skill_file` results. `system.md` tells the model to read a skill with `read_skill_file` before using its tools.
+Skill bodies are never in the system prompt; they arrive as `read_skill_file` results. Descriptions say only what a skill does and returns; which source to prefer is a `system.md` rule.
 
 ### 7.2 Skills (`agent/skill_loader.py: load_skills`)
 
@@ -214,54 +248,82 @@ Reads `agent/skills/` once at startup and fails fast with the bad path: `<name>/
 
 | Skill | allowed-tools | Does |
 |---|---|---|
+| `checking-the-weather` | `get_weather` | current weather for a named city; asks for the city when none is given, current conditions only, reports the tool's error plainly |
 | `retrieving-from-documents` | `retrieve_from_documents` | explains the tool, searches (retry once with other words), answers from the passages with `(filename, p. N)` citations, says so when nothing is found |
+| `searching-the-web` | `web_search` | searches (retry once with other words on an error or "No web results."), answers from the snippets with `[title](url)` citations, says first when the documents had nothing |
 
 The format is documented in [skill-template/SKILL.md](skill-template/SKILL.md).
 
 ### 7.3 Progressive disclosure (`agent/middleware/progressive_disclosure.py: ProgressiveDisclosure`)
 
-1. **`awrap_model_call`:** the model sees `read_skill_file` plus unlocked tools. Unlocked = `allowed-tools` of every skill whose exact text is a `read_skill_file` result this turn.
+1. **`awrap_model_call`:** the model sees `read_skill_file` plus unlocked tools. Unlocked = `allowed-tools` of every skill whose exact text is a `read_skill_file` result this turn. "This turn" = after the last `HumanMessage` (`agent/state.py: split_turns`); a skill read in an earlier turn of the session unlocks nothing, so a follow-up that needs a search reads the skill again.
 2. **`awrap_tool_call`:** a locked tool returns `Tool '<name>' is locked. Read the skill that lists it first.` (status error) without running.
 
-A document question therefore takes at least three model calls: read the skill, search, answer.
+A document, web or weather question therefore takes at least three model calls: read the skill, call the tool, answer.
 
-### 7.4 Tools (`agent/tools.py`)
+### 7.4 Tools (`agent/tools.py`, MCP)
 
-| Tool | Available | Returns |
-|---|---|---|
-| `read_skill_file(path)` | always | the skill file text, or `Unknown file '<path>'. Available: [...]` |
-| `retrieve_from_documents(query)` | a skill listing it was read this turn | up to `RETRIEVE_LIMIT = 4` passages |
+| Tool | Source | Available | Returns |
+|---|---|---|---|
+| `read_skill_file(path)` | local | always | the skill file text, or `Unknown file '<path>'. Available: [...]` |
+| `retrieve_from_documents(query)` | local | a skill listing it was read this turn | up to `RETRIEVE_LIMIT = 4` passages |
+| `web_search(query)` | MCP `search` | same | up to 5 results (`title`, URL, snippet) and `(via Tavily)` / `(via DuckDuckGo)`; error when nothing is found |
+| `get_weather(city)` | MCP `weather` | same | one sentence with condition, °C and humidity; error such as `No matching location found.` |
 
 `retrieve_from_documents`:
 1. `owner_id` comes from `AgentContext`, not from the model.
 2. `DocumentService.search` embeds the query (with the instruction prefix) and calls `SqlDocumentRepository.search`: `SET LOCAL hnsw.iterative_scan = strict_order` (so the owner filter can't starve the HNSW candidates), top 4 chunks of the owner by cosine distance, plus chunks `ordinal ± 1` **on the same page** as context (context from another page made the model cite the wrong page).
-3. Format, each context side cut to `CONTEXT_CHARS = 300`. No hits → `No matching passages in the document library.`
+3. Format: header `[filename, page N]` (no chunk id: models copied it into citations, which the frontend's `(file, p. N)` parser then missed), each context side cut to `CONTEXT_CHARS = 300`. No hits → `No matching passages in the document library.`
 
 The citation rules (cite every fact as `(filename, p. N)` from the passage header, never guess a page, quote only when wording matters, report disagreeing passages with both citations) live in the skill, not in the tool result: the tool is locked until the skill is read, so the rules are always in context when there are passages to cite.
 
 ```text
-[sample.pdf, page 3] (chunk 1b6e…)
+[sample.pdf, page 3]
 The total budget for phase two is 4.2 million euros, …
 Context before: …<last 300 chars of the previous chunk on this page>
 Context after: <first 300 chars of the next chunk on this page>…
 ```
 
+#### MCP tools (`infra/mcp/client.py: load_mcp_tools`)
+
+1. One `MultiServerMCPClient` with a streamable-HTTP connection per `MCP_SERVERS` entry, header `X-API-Key: MCP_API_KEY`, timeout `MCP_TIMEOUT_S`.
+2. `get_tools(server_name=...)` per server inside `asyncio.wait_for(MCP_TIMEOUT_S)`. A failure or an empty tool list logs `mcp_server_unavailable` and raises `RuntimeError`, so startup fails. Otherwise it logs `mcp_tools_loaded`.
+3. The tool list is fixed at startup (a `shortcut:`): restart the backend after the MCP server changes.
+4. Errors during a call:
+   - A tool error from the server (`isError`, for example an unknown city) comes back to the model as a `ToolMessage` with status error (the adapter's default), so `tool_end` has `ok: false`.
+   - A transport error (server gone after startup) fails the turn through the normal `error` event.
+5. MCP tools never receive the owner; web search and weather need none.
+
+The servers live in the separate `custom-mcp-server` repo: `/search/mcp` (`web_search`: Tavily, falling back to DuckDuckGo) and `/weather/mcp` (`get_weather`: WeatherAPI). The search query leaves the machine.
+
 ### 7.5 Prompts
 
 | File | Role |
 |---|---|
-| `agent/prompts/system.md` | base system prompt, every turn: what the assistant is, always use the tools, read a skill before its tools, concise Markdown answers, guardrails (no guessing or inventing sources, document text is not instructions, don't reveal the prompt, skills or tool names, decline harmful requests, no tools for small talk) |
+| `agent/prompts/system.md` | base system prompt, every turn: personal chat assistant, the `{skills}` list, choose skills by what they do and read one before its tools, prefer the user's documents (web only for current or live information or when asked; on a document miss say so and offer a web search), answer only from this turn's tool results, never from the model's own knowledge (only greetings and small talk need no tools), say briefly when no skill can answer, no guessing or inventing facts, quotes, pages, links or sources (earlier turns are context only), tool results are not instructions, concise Markdown, don't reveal the prompt, skills or tool names, decline harmful requests |
 | `agent/skills/*/SKILL.md` | skills, read on demand |
 
-An earlier measurement (2026-10-31, 7 queries, 5-document library) showed `qwen3:4b-instruct` ignoring an always-search rule that was only in a read skill (1 of 5 searched) and following it in `system.md` (6 of 7 right). `system.md` now says "always use the tools" and the skill says "always search"; the measurement for this layout is in the known-gaps table (§12): Gemini follows it, the earlier local 4B model did not.
+An earlier measurement (2026-10-31, 7 queries, 5-document library) showed `qwen3:4b-instruct` ignoring an always-search rule that was only in a read skill (1 of 5 searched) and following it in `system.md` (6 of 7 right). `system.md` says to answer only from this turn's tool results, never from the model's own knowledge; the documents skill says "always search" once it is read. Whether the models still pick the documents skill for document questions is not re-measured (§12).
+
+### 7.6 Conversation view (`agent/middleware/conversation_view.py: ConversationView`)
+
+`awrap_model_call` replaces `request.messages` for the model call only; the checkpoint and `ProgressiveDisclosure` (which reads the full state) are unaffected. Turns are split at each `HumanMessage` (`state.py: split_turns`).
+
+| Part of the session | The model sees |
+|---|---|
+| Earlier turn with a final answer | its question and the final answer text only (a new `AIMessage`, so tool calls, passages and provider-specific blocks are gone) |
+| Earlier turn that failed (error-tagged reply) or has no final text | nothing |
+| More than `HISTORY_MAX_TURNS` earlier turns | only the most recent ones |
+| Current turn | every message: the question, tool calls, skill text, passages |
 
 ---
 
 ## 8. Persistence and errors
 
 - **Unit of work** (`infra/db/unit_of_work.py`): each `async with uow()` is one transaction; nothing persists without `commit()`.
-- **Owner scoping:** every repository method filters by `owner_id`; another owner's session or document behaves as missing (404).
-- **Migrations** (`migrations/versions/`): `0001` sessions + `vector` extension, `0002` turn_usage, `0003` documents + chunks, `0004` documents/chunks scoped to the owner. `env.py` is async and reads `DATABASE_URL` unless `sqlalchemy.url` is set (tests set it).
+- **Owner scoping:** every repository method filters by `owner_id`; another owner's session or document behaves as missing (404). The two exceptions are system-level and return no document data: `has_other_embedding_model` (readiness) and `fail_pending` (startup recovery).
+- **Checkpoints:** `checkpoints`, `checkpoint_blobs`, `checkpoint_writes`, `checkpoint_migrations`, created by `AsyncPostgresSaver.setup()` at startup (not Alembic), keyed by `thread_id` = session id. The pool is separate from the SQLAlchemy engine because the saver uses psycopg (`Settings.checkpoint_database_url` = `DATABASE_URL` without `+asyncpg`).
+- **Migrations** (`migrations/versions/`): `0001` sessions + `vector` extension, `0002` turn_usage, `0003` documents + chunks, `0004` documents/chunks scoped to the owner, `0005` `document_files` (original PDFs; earlier documents get no row). `env.py` is async and reads `DATABASE_URL` unless `sqlalchemy.url` is set (tests set it).
 - **Errors:** `core/errors.py: AppError` subclasses become `{"error": {"code", "message"}}`: `AppError` 400 `bad_request`, `NotFoundError` 404, `ConflictError` 409, `PayloadTooLargeError` 413, `UnknownModelError` 422 `unknown_model`, `InvalidDocumentError` 422 `invalid_document`, anything else 500 `internal_error` (logged with traceback). FastAPI validation errors stay 422 with FastAPI's body.
 
 ---
@@ -273,14 +335,20 @@ structlog, console or JSON per `LOG_JSON`; `request_id` on every line of a reque
 | Event | Where | Fields |
 |---|---|---|
 | `http_request` | `main.py` middleware | method, path, status, duration_ms (SSE: time to first byte) |
-| `upload_received` / `upload_rejected` | `DocumentService.upload` | document_id, filename, bytes / reason = size, type, duplicate |
+| `upload_received` / `upload_rejected` | `DocumentService.upload` | document_id, filename, bytes, replaced_document_id (the failed copy it replaced, else null) / reason = size, type, duplicate |
+| `ingestion_interrupted` | `DocumentService.fail_interrupted` (startup) | documents (WARNING when > 0) |
 | `ingestion_started` / `ingestion_done` / `ingestion_failed` | `DocumentService.ingest` | pages, chunks, embed_batches, `load_ms` `chunk_ms` `embed_ms` `store_ms`, total_ms |
 | `document_deleted` | `DocumentService.delete` | document_id |
 | `search_done` | `DocumentService.search` | hits, query_chars, duration_ms |
-| `turn_started` / `turn_done` / `turn_failed` | `ChatService.stream` | session_id, model_id, tokens, latency_ms |
+| `turn_started` / `turn_done` / `turn_failed` | `ChatService.stream` | session_id, model_id, prior_turns, tokens, latency_ms |
+| `turn_rejected` | `ChatService.stream` | session_id, reason = session_busy (WARNING) |
+| `history_error_save_failed` | `ChatService._save_error_reply` | session_id (ERROR, with traceback; the turn just has no saved reply) |
+| `history_view` | `ConversationView.awrap_model_call` | prior_turns, messages_in, messages_out (DEBUG, every model call) |
 | `model_skipped` | `ModelFactory` (startup) | model_id, provider (no registered provider, e.g. a model whose API key is not set) |
 | `tool_start` / `tool_end` / `tool_limit_reached` | `ChatService` | tool, tool_call_id, ok, duration_ms |
 | `skills_loaded` | `load_skills` (startup) | skills |
+| `mcp_tools_loaded` | `load_mcp_tools` (startup) | server, tools |
+| `mcp_server_unavailable` | `load_mcp_tools` (startup) | server, url, error = exception type or `no_tools` (ERROR; startup then fails) |
 | `skill_read` | `read_skill_file` | path, status = ok / unknown_path, source = read_skill_file |
 | `tool_locked` | `ProgressiveDisclosure.awrap_tool_call` | tool |
 | `app_error` | `core/errors.py` handler | code, message, path (an `AppError` returned to the client) |
@@ -293,12 +361,17 @@ Tests use `structlog.testing.capture_logs` (`tests/integration/test_logging.py`)
 
 ## 10. Frontend
 
-`frontend/` is a React + Vite SPA (Tailwind, shadcn/ui) calling the backend directly (CORS). `src/lib/api.ts` holds the typed REST calls and `streamMessage`. Views:
-- sessions sidebar (new, rename, delete);
-- chat: markdown with raw HTML skipped; under each answer one collapsed line such as `1 skill · 2 tools`, which expands to `skill: <name>` per skill read this turn (from `read_skill_file` `tool_start` args, pre-reads included) and `tool: <name> …/✓/✗` per other tool call; a one-line hint when the library is empty;
-- Library: drop zone or picker, multi-file, per-file status, polls every 2 s while any document is `pending`, delete.
+`frontend/` is a React + Vite SPA (Tailwind, shadcn/ui) calling the backend directly (CORS). `src/lib/api.ts` holds the typed REST calls and `streamMessage`; every failed call throws `ApiError` with the backend's `error.message` (`api.ts: errorMessage`, falling back to `Request failed (<status>)`), so toasts show the real reason. Layout (`App.tsx`):
+- **rail** (`App.tsx: Rail`, fixed 240 px from `md` up; below that a left `Sheet` opened from the header): Chat / Library switch with the document count, sessions list (title + `Today` / `Yesterday` / date from `updated_at`, new session; the active row, and any row while hovered or focused, shows rename and delete in place of the date), library summary by status;
+- **header**: the session title and question count, or `Library` with document and page totals; clicking the title renames the open session, and a delete button sits on the right. Renaming, from the header or a rail row, swaps the title for an inline box (`App.tsx: TitleEditor`): Enter saves a changed, non-empty title (`PATCH /sessions/{id}`), Esc or leaving the box cancels. Delete asks with the browser's confirm;
+- **chat** (`components/Chat.tsx`): each question is a heading and its answer sits below it (markdown, raw HTML skipped); under each answer one line lists `Skill <name>` per skill read this turn (from `read_skill_file` `tool_start` args, pre-reads included) and `Tool <name> "<input>"` with running/✓/✗ per other tool call, where the input is the call's string args (the search query or the city, cut to 40 characters with the full text on hover), so two searches with one tool read as different calls; the composer holds the textarea, the model picker (id + provider) and Send; hints for an empty library or an empty session. A `session_busy` error (another tab is answering this session) removes the question and its placeholder answer, puts the text back in the composer and shows the message as a toast, so the view matches what the backend stored;
+- **citations** (`lib/citations.ts: CITATION`, `parseCitations`): `(file.pdf, p. N)` in an answer, also with the filename in backticks and page lists or ranges (`p. 2, 3`, `pp. 4-6`), renders as a page chip (`Chat.tsx: markCitations` rewrites it into a `#cite` markdown link that the renderer draws as a chip). The chip shows only the file name. `Chat.tsx: CitationChip` looks up a `ready` library document with that filename: when it `has_file`, the chip is a link (↗, titled "Open <file> at page N") that opens `documentFileUrl(id, first cited page)` (`/documents/{id}/file#page=N`) in a new tab, in the browser's PDF viewer; otherwise it stays plain, titled with the cited pages and the reason: "p. N · Original not stored. Delete and upload again to open it." (document found without a file) or "p. N · This document is no longer in the library." (none found);
+- **Sources** (`components/Sources.tsx`, `xl` and up, chat only): per cited document a strip of its pages with the cited ones filled (numbered tiles up to 12 pages, thin ticks up to 60, page list only beyond), the citation count and pages; ready documents not cited are listed under "Also in your library". Built from the answer text only; the passages themselves are not shown yet;
+- **Library** (`components/Library.tsx`): drop strip and file picker, multi-file. Files upload one at a time, across drops too (a promise queue), with `api.uploadDocument` over `XMLHttpRequest` for upload progress; each file gets a row: `Queued` → percent with a shadcn `Progress` bar → `Processing…` at 100% until the 202 → removed, and the library refreshes for that file. A rejected upload keeps its row with the backend's message and a dismiss button. Table with pages, added time (hidden on phones), status dot (Ready / Processing / Failed) and the error under a failed file; polls every 2 s while any document is `pending`; delete.
 
-Chat turns live in tab state only: a refresh clears them, matching the stateless backend.
+Theme: all colours are CSS variables in `frontend/src/index.css` (shadcn token names, light in `:root`, dark in `.dark`, which `main.tsx` toggles from `prefers-color-scheme`). Palette is warm-grey neutrals with one indigo accent (`--primary`, also the focus ring); `--accent` is the tinted indigo surface for the active session and session hover; `--success` / `--warning` / `--destructive` colour document status. Corners are `--radius: 0.125rem` (2px), so every shadcn radius scales from it. The face is Albert Sans, loaded from Google Fonts in `frontend/index.html` with the system sans as fallback, so offline use falls back to the system face.
+
+Chat turns live in tab state, loaded from `GET /sessions/{id}/messages` the first time a session is opened in a page load, so a refresh keeps the conversation.
 
 ---
 
@@ -317,13 +390,17 @@ Tests hit **real** Postgres (`TEST_DATABASE_URL`, truncated before each test) an
 
 | Test file | Checks |
 |---|---|
-| `tests/unit/test_skill_loader.py` | shipped skill loads and is indexed with its tools; malformed or empty skill dirs rejected |
-| `tests/unit/test_progressive_disclosure.py` | tools hidden until a skill is read; locked call refused; citation rules live in the skill, tool result is passages only |
+| `tests/unit/test_skill_loader.py` | the three shipped skills load with their exact tools and are indexed in place of `{skills}`; the shipped `system.md` has the placeholder; a prompt without it, malformed or empty skill dirs rejected |
+| `tests/unit/test_chat_history.py` | history keeps every tool call with its `args` and `ok` (a failed call is `ok: false`) |
+| `tests/unit/test_agent_builder.py` | duplicate tool names rejected; skills naming missing tools (the MCP tools when none are loaded) rejected |
+| `tests/integration/test_mcp.py` | an unreachable MCP server fails loading (always runs); with custom-mcp-server up, `web_search` and `get_weather` load and a real `web_search` call returns results (calls Tavily or DuckDuckGo, no LLM) |
+| `tests/unit/test_progressive_disclosure.py` | tools hidden until a skill is read; a skill read in an earlier turn unlocks nothing; locked call refused; citation rules live in the skill, tool result is passages only |
+| `tests/unit/test_conversation_view.py` | earlier turns shrink to question + answer, current turn whole, failed/unanswered turns hidden, only the last `history_max_turns` kept |
 | `tests/unit/test_chunkers.py`, `test_model_factory.py` | chunk packing/overlap; catalog validation: Gemini + Groq build, default = first, unregistered provider skipped, duplicate ids and unknown options rejected |
-| `tests/integration/test_documents.py` | upload validation, ingestion, delete cascade, owner isolation, chat answer cites p. 3 via `retrieve_from_documents` |
-| `tests/integration/test_chat.py`, `test_sessions.py`, `test_models.py`, `test_health.py` | SSE turn + usage + first-message title, `model_id` default/selection/rejection, error event, session CRUD, `/models` with and without a key, live Gemini and Groq answers (skip without `GOOGLE_API_KEY` / `GROQ_API_KEY`), `/health` + `/ready` |
+| `tests/integration/test_documents.py` | upload validation, ingestion, delete cascade (chunks and the stored file), owner isolation, the original served back byte-for-byte (`has_file`, 404 for another owner and unknown ids), a pre-`0005` document without a file, startup failing an interrupted `pending` document and the re-upload replacing it, chat answer cites p. 3 via `retrieve_from_documents` |
+| `tests/integration/test_chat.py`, `test_sessions.py`, `test_models.py`, `test_health.py` | SSE turn + usage + first-message title, `model_id` default/selection/rejection, error event, failed turn saved as an error reply and removed with the session, a second send to a busy session rejected with `session_busy` and its history delete refused (rejected Groq key, no quota), follow-up resolved against the earlier turn (model-dependent), history empty and owner-private, session CRUD, `/models` with and without a key, live Gemini and Groq answers (skip without `GOOGLE_API_KEY` / `GROQ_API_KEY`), `/health` + `/ready` |
 | `tests/integration/test_logging.py` | key log events for ingestion and a chat turn |
-| `tests/integration/test_migrations.py` | upgrade → downgrade → upgrade, `0004` backfill and dedupe |
+| `tests/integration/test_migrations.py` | upgrade → downgrade → upgrade over every revision, `0004` backfill and dedupe |
 
 The chat-with-document tests depend on model output and can fail intermittently.
 
@@ -333,12 +410,21 @@ The chat-with-document tests depend on model output and can fail intermittently.
 
 | Shortcut | Limit | Upgrade when |
 |---|---|---|
-| FastAPI `BackgroundTasks` for ingestion | in-flight jobs lost on restart; the row stays `pending` | ingestion must survive restarts → job queue |
+| FastAPI `BackgroundTasks` for ingestion | in-flight jobs are lost on restart; the row is marked `failed` at the next startup and the user uploads again | ingestion must survive restarts → job queue, or resume from `document_files` |
+| Startup fails every `pending` row | assumes one API process; a second worker starting would fail the first one's in-flight ingestion | several workers → job queue |
 | Size check after the body is received | multipart spools the whole upload first | exposed publicly → body limit at the proxy |
 | pypdf text only | no OCR, tables flattened | scanned PDFs matter → OCR loader |
 | Manual model choice | no automatic routing between models | measured need → routing middleware |
 | Skill read by the model itself | every document question costs 3 model calls (read skill, search, answer). Measured 2026-10-31: Gemini 3.5-flash-lite and 3.6-flash read the skill and searched on every document question; the former local `qwen3:4b-instruct` searched 0 of 6, and a `system.md` line naming the skill did not help | check whether the Groq model does; otherwise the tool always available (2 calls, matters for the Gemini daily quota) |
 | Hand-written frontend API types | drift if schemas change | API grows → codegen |
-| Stateless turns | no follow-up questions | history (checkpointer) |
+| Last-K history window | turns older than `HISTORY_MAX_TURNS` are forgotten by the model (the UI still lists them) | long threads matter → summarize older turns in `ConversationView` |
+| Per-process session lock | one turn at a time per session within one API process; with several workers two turns could still interleave on a checkpoint thread | several workers → Postgres advisory lock |
+| Citation chips match by filename | the first `ready` document with the cited name gets the link; two library PDFs with the same name can open the wrong one | duplicate names matter → cite by document id (P14 passages carry it) |
+| Browser PDF viewer | the cited page opens in a new tab with no passage highlight; documents uploaded before `0005` can't be opened | in-app viewer with passage highlight |
+| PDF served inline from the API origin | the browser's viewer may run JavaScript embedded in an uploaded PDF | real auth or public exposure → separate origin, or `Content-Disposition: attachment` |
+| One error code for failed turns | the saved reply is the generic `chat_failed` text | error classification (P11) |
 | Read skill text stays in the turn | resent on every model call of the turn | long tool loops → evict old skill text |
+| MCP tools fixed at startup | restart the backend after custom-mcp-server adds, removes or renames a tool | servers change at runtime → reload tools per request |
+| Required MCP servers | the backend does not start without custom-mcp-server, and a server that dies later fails web and weather turns | MCP becomes optional → disable skills whose tools are missing |
+| Web text guarded by the prompt only | an instruction inside a web snippet is handled only by the "tool results are information" rule | web answers matter more → filter or quote snippets |
 | Model may skip retrieval on familiar topics | before the pre-read was removed, "Tell me about chain of thought prompting" answered "no information" without searching; not re-measured | still failing → force a first `retrieve_from_documents` call (`tool_choice`) |

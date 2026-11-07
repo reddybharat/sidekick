@@ -114,7 +114,7 @@ async def test_citation_rules_live_in_the_skill_and_results_are_passages_only() 
     found = await make_retrieve_from_documents(one_hit).ainvoke(args)
     empty = await TOOLS[1].ainvoke(args)
 
-    assert found == f"[report.pdf, page 3] (chunk {hit.chunk_id})\nBudget 4.2 M."
+    assert found == "[report.pdf, page 3]\nBudget 4.2 M."
     assert empty == NO_HITS
     assert "Cite every fact as (filename, p. N)" in RETRIEVING.text
 
@@ -124,3 +124,11 @@ async def test_read_skill_file_returns_the_file_or_lists_valid_paths() -> None:
 
     assert await read_skill_file.ainvoke({"path": RETRIEVING.path}) == RETRIEVING.text
     assert "Available:" in await read_skill_file.ainvoke({"path": "nope.md"})
+
+
+async def test_a_skill_read_in_an_earlier_turn_does_not_unlock_tools_now() -> None:
+    earlier_turn = [HumanMessage("q1"), _read(RETRIEVING.text), AIMessage("a1")]
+    state = {"messages": [*earlier_turn, HumanMessage("q2")]}
+
+    assert await _visible_tools(state) == [READ_SKILL_FILE]
+    assert await _visible_tools({"messages": [*state["messages"], _read(RETRIEVING.text)]}) == BOTH

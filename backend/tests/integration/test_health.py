@@ -1,9 +1,13 @@
 from collections.abc import Callable
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
 from app.main import REQUEST_ID_HEADER, create_app
+
+# The app does not start without its MCP servers.
+pytestmark = pytest.mark.usefixtures("mcp_servers")
 
 UNREACHABLE_DATABASE_URL = "postgresql+asyncpg://nobody:nobody@127.0.0.1:1/nothing"
 UNREACHABLE_OLLAMA_URL = "http://127.0.0.1:1"

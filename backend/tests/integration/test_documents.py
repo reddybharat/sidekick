@@ -1,16 +1,27 @@
+import hashlib
 import json
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.container import Container
 from app.core.config import Settings
 from app.main import create_app
+from app.services.documents import INTERRUPTED_MESSAGE
+
+# The app does not start without its MCP servers.
+pytestmark = pytest.mark.usefixtures("mcp_servers")
 
 SAMPLE_PDF = Path(__file__).parents[1] / "fixtures" / "sample.pdf"
 PDF_TYPE = "application/pdf"
 TINY_UPLOAD_LIMIT = 100
+INSERT_DOCUMENT_SQL = (
+    "INSERT INTO documents (id, owner_id, filename, sha256, embedding_model, status) "
+    "VALUES ('{id}', 'local', '{filename}', '{sha256}', 'any-model', '{status}')"
+)
 type RunSql = Callable[[str], list[tuple[object, ...]]]
 
 
@@ -154,6 +165,72 @@ def test_delete_removes_document_and_its_chunks(
     assert again.status_code == 404
     assert remaining == []
     assert run_sql("SELECT count(*) FROM chunks") == [(0,)]
+    assert run_sql("SELECT count(*) FROM document_files") == [(0,)]
+
+
+def test_upload_keeps_the_original_and_serves_it_to_its_owner_only(
+    migrated_database_url: str,
+) -> None:
+    data = SAMPLE_PDF.read_bytes()
+    with TestClient(create_app(Settings(database_url=migrated_database_url))) as client:
+        document_id = client.post(
+            "/documents", files={"file": ("sample.pdf", data, PDF_TYPE)}
+        ).json()["id"]
+        [listed] = client.get("/documents").json()
+        original = client.get(f"/documents/{document_id}/file")
+        unknown = client.get(f"/documents/{uuid.uuid4()}/file")
+    other_owner = Settings(database_url=migrated_database_url, default_owner_id="someone-else")
+    with TestClient(create_app(other_owner)) as client:
+        foreign = client.get(f"/documents/{document_id}/file")
+
+    assert listed["has_file"] is True
+    assert original.status_code == 200
+    assert original.headers["content-type"] == PDF_TYPE
+    assert original.headers["content-disposition"] == "inline; filename*=UTF-8''sample.pdf"
+    assert original.content == data
+    assert unknown.status_code == 404
+    assert foreign.status_code == 404
+
+
+def test_a_document_uploaded_before_originals_were_kept_cannot_be_opened(
+    migrated_database_url: str, run_sql: RunSql
+) -> None:
+    document_id = uuid.uuid4()
+    run_sql(
+        INSERT_DOCUMENT_SQL.format(
+            id=document_id, filename="old.pdf", sha256="0" * 64, status="failed"
+        )
+    )
+    with TestClient(create_app(Settings(database_url=migrated_database_url))) as client:
+        [listed] = client.get("/documents").json()
+        original = client.get(f"/documents/{document_id}/file")
+
+    assert listed["has_file"] is False
+    assert original.status_code == 404
+
+
+def test_startup_fails_interrupted_ingestion_and_the_pdf_can_be_uploaded_again(
+    migrated_database_url: str, run_sql: RunSql
+) -> None:
+    data = SAMPLE_PDF.read_bytes()
+    interrupted_id = uuid.uuid4()
+    run_sql(
+        INSERT_DOCUMENT_SQL.format(
+            id=interrupted_id,
+            filename="sample.pdf",
+            sha256=hashlib.sha256(data).hexdigest(),
+            status="pending",
+        )
+    )
+    with TestClient(create_app(Settings(database_url=migrated_database_url))) as client:
+        [interrupted] = client.get("/documents").json()
+        again = client.post("/documents", files={"file": ("sample.pdf", data, PDF_TYPE)})
+        listed = client.get("/documents").json()
+
+    assert (interrupted["status"], interrupted["error"]) == ("failed", INTERRUPTED_MESSAGE)
+    assert again.status_code == 202
+    assert again.json()["id"] != str(interrupted_id)
+    assert [d["id"] for d in listed] == [again.json()["id"]]
 
 
 def test_library_is_cross_origin_readable_from_the_dev_frontend(

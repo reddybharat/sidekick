@@ -6,8 +6,10 @@ from langchain.agents.middleware import ToolCallLimitMiddleware
 from langchain.agents.middleware.types import AgentMiddleware, InputAgentState, OutputAgentState
 from langchain_core.language_models import BaseChatModel
 from langchain_core.tools import BaseTool
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.state import CompiledStateGraph
 
+from app.agent.middleware.conversation_view import ConversationView
 from app.agent.middleware.progressive_disclosure import ProgressiveDisclosure
 from app.agent.skill_loader import SkillCatalog
 from app.agent.state import AgentContext
@@ -23,20 +25,29 @@ def build_agent(
     system_prompt: str,
     catalog: SkillCatalog,
     tools: Sequence[BaseTool],
+    checkpointer: BaseCheckpointSaver[Any],
+    history_max_turns: int,
 ) -> Agent:
+    all_tools = [make_read_skill_file(catalog), *tools]
+    names = [t.name for t in all_tools]
+    duplicates = {n for n in names if names.count(n) > 1}
+    if duplicates:
+        raise ValueError(f"duplicate tool names: {sorted(duplicates)}")
     named = {t for s in catalog.skills.values() for t in s.allowed_tools}
-    missing = named - {t.name for t in tools}
+    missing = named - set(names)
     if missing:
         raise ValueError(f"skills name unknown tools: {sorted(missing)}")
     middleware: list[AgentMiddleware[Any, AgentContext, Any]] = [
+        ConversationView(history_max_turns),
         ProgressiveDisclosure(catalog),
         # Over the limit, further tool calls get an error result and the model has to answer.
         ToolCallLimitMiddleware(run_limit=MAX_TOOL_CALLS_PER_TURN, exit_behavior="continue"),
     ]
     return create_agent(
         model,
-        tools=[make_read_skill_file(catalog), *tools],
+        tools=all_tools,
         system_prompt=catalog.system_prompt(system_prompt),
         middleware=middleware,
         context_schema=AgentContext,
+        checkpointer=checkpointer,
     )

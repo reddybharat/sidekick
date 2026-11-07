@@ -15,7 +15,7 @@ from langchain_core.messages import ToolMessage
 from langgraph.types import Command
 
 from app.agent.skill_loader import SkillCatalog
-from app.agent.state import AgentContext
+from app.agent.state import AgentContext, split_turns
 from app.agent.tools import READ_SKILL_FILE
 
 LOCKED_TEXT = "Tool '{name}' is locked. Read the skill that lists it first."
@@ -30,9 +30,11 @@ class ProgressiveDisclosure(AgentMiddleware[AgentState[Any], AgentContext, Any])
 
     def _unlocked(self, state: Mapping[str, Any]) -> set[str]:
         """Tools of every skill whose file text was returned by `read_skill_file` this turn."""
+        # Earlier turns are checkpointed too, but a skill read then does not unlock tools now.
+        current = split_turns(state["messages"])[-1]
         read = {
             m.content
-            for m in state["messages"]
+            for m in current
             if isinstance(m, ToolMessage)
             and m.name == READ_SKILL_FILE
             and isinstance(m.content, str)
