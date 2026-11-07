@@ -82,6 +82,7 @@ class Document(BaseModel):
     status: DocumentStatus
     error: str | None
     created_at: datetime
+    has_file: bool
 
 
 class ChunkIn(BaseModel):

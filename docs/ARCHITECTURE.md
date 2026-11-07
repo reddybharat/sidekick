@@ -139,14 +139,16 @@ Locked tools are hidden from the model's tool schema, and a call to one is refus
 ```mermaid
 flowchart LR
     up["POST /documents"] --> val{"validate<br/>PDF · size · sha256"}
-    val -- "duplicate in library" --> dup["409"]
+    val -- "duplicate in library<br/>(not failed)" --> dup["409"]
     val -- "not a PDF" --> bad["422"]
     val -- "too large" --> big["413"]
-    val -- ok --> pend["documents row<br/>status = pending"]
+    val -- "ok, or replaces a failed copy" --> pend["documents row<br/>status = pending"]
+    pend --- file[("document_files<br/>original bytes")]
     pend --> bg["background task"]
     bg --> load["pypdf pages"] --> chunk["per-page chunker"] --> emb["qwen3-embedding<br/>1024-d"] --> store[("chunks<br/>pgvector + HNSW")]
     store --> ready["status = ready"]
     bg -. error .-> failed["status = failed + error"]
+    bg -. "restart: marked at next startup" .-> failed
 ```
 
 ---
@@ -157,6 +159,7 @@ flowchart LR
 erDiagram
     sessions ||--o{ turn_usage : records
     documents ||--o{ chunks : "split into"
+    documents ||--o| document_files : "keeps original"
 
     sessions {
         uuid id PK
@@ -185,6 +188,10 @@ erDiagram
         text content
         vector embedding "1024, HNSW"
     }
+    document_files {
+        uuid document_id PK, FK
+        bytea data
+    }
     turn_usage {
         uuid id PK
         uuid session_id FK
@@ -196,7 +203,7 @@ erDiagram
     }
 ```
 
-`documents` is unique on `(owner_id, sha256)`. `chunks.owner_id` is denormalised so every vector search filters by owner without a join. Sessions and documents are independent: deleting a session leaves the library untouched.
+`documents` is unique on `(owner_id, sha256)`. `chunks.owner_id` is denormalised so every vector search filters by owner without a join. `document_files` is separate so document lists and vector searches never load the bytes; documents uploaded before it existed have no row. Sessions and documents are independent: deleting a session leaves the library untouched.
 
 Conversation history lives in the LangGraph checkpoint tables (`checkpoints`, `checkpoint_blobs`, `checkpoint_writes`), keyed by `thread_id` = the session id. The saver creates them itself at startup, so they are not in Alembic. Deleting a session deletes its thread first.
 
@@ -215,6 +222,7 @@ Conversation history lives in the LangGraph checkpoint tables (`checkpoints`, `c
 | D8 | Chunks never cross a page, and retrieval context comes from the same page only, so every citation has one correct page |
 | D9 | The owner comes from the server and reaches tools through `AgentContext`, never through tool arguments or the model |
 | D10 | Logs carry ids, counts, sizes and durations, never message text, document content or file bytes |
+| D11 | The original PDF is kept in Postgres (`document_files`) and served inline (`GET /documents/{id}/file`), so a citation chip opens the browser's own PDF viewer at `#page=N` and every citation can be checked against its source |
 
 ### D7: document library instead of per-session workspaces
 - **Context:** PDFs were first scoped to the session they were uploaded in. Everything is local, so ingesting once ahead of time is cheap, and the same PDF was being embedded again for every session.
@@ -239,3 +247,5 @@ Planned enhancements and where each plugs in:
 | More chat providers | New provider registered in `ModelFactory` (Gemini and Groq were added) |
 | Tracing + evals | Langfuse callback handler; eval datasets |
 | Real auth | Replace `DEFAULT_OWNER_ID` with a resolved user in `api/deps.py` |
+| In-app viewer with passage highlight | Render the stored original (`GET /documents/{id}/file`) in the app and highlight the cited passage (today the browser viewer opens the page) |
+| Resume interrupted ingestion | At startup, re-run `DocumentService.ingest` for `pending` documents from `document_files` instead of marking them failed |

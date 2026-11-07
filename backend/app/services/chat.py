@@ -1,4 +1,6 @@
+import asyncio
 import time
+import weakref
 from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any, cast
 
@@ -17,7 +19,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from app.agent.agent_builder import Agent
 from app.agent.state import ERROR_CODE_KEY, AgentContext, split_turns
 from app.agent.tools import READ_SKILL_FILE
-from app.core.errors import UnknownModelError
+from app.core.errors import ConflictError, UnknownModelError
 from app.domain.models import (
     ChatEvent,
     DoneEvent,
@@ -42,6 +44,11 @@ SKILL_FILE_SUFFIX = "/SKILL.md"
 MODEL_NODE = "model"
 CHAT_FAILED_CODE = "chat_failed"
 CHAT_FAILED_MESSAGE = "The model failed to answer. Try again."
+SESSION_BUSY_CODE = "session_busy"
+SESSION_BUSY_MESSAGE = (
+    "This chat is answering in another tab. Wait for it to finish, then send again."
+)
+SESSION_ANSWERING_MESSAGE = "This chat is still answering. Try again when it finishes."
 
 
 class ChatService:
@@ -60,6 +67,11 @@ class ChatService:
         self._checkpointer = checkpointer
         self._default_model_id = next(iter(agents))
         self._sessions = sessions
+        # One turn at a time per session: concurrent turns would interleave on one checkpoint
+        # thread. An entry lives only while a stream holds its lock.
+        # shortcut: per-process lock, enough for one owner and one API process; several workers →
+        # Postgres advisory lock.
+        self._busy: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 
     def resolve_model_id(self, model_id: str | None) -> str:
         """The requested model, or the default (the catalog's first); unknown ids are rejected."""
@@ -79,73 +91,90 @@ class ChatService:
         ]
 
     async def delete_history(self, session: Session) -> None:
+        """Refused while a turn is streaming, which would keep writing to the deleted thread."""
+        lock = self._busy.get(str(session.id))
+        if lock is not None and lock.locked():
+            raise ConflictError(SESSION_ANSWERING_MESSAGE)
         await self._checkpointer.adelete_thread(str(session.id))
 
     async def stream(self, session: Session, text: str, model_id: str) -> AsyncIterator[ChatEvent]:
-        started = time.perf_counter()
-        turn_log = log.bind(session_id=str(session.id), owner_id=session.owner_id)
-        agent = self._agents[model_id]
-        config = _thread_config(session)
-        tool_started: dict[str, float] = {}
-        input_tokens = output_tokens = 0
-        try:
-            prior_turns = sum(t.role == "user" for t in await self.history(session))
-            turn_log.info(
-                "turn_started",
-                model_id=model_id,
-                message_chars=len(text),
-                prior_turns=prior_turns,
+        sid = str(session.id)
+        lock = self._busy.setdefault(sid, asyncio.Lock())
+        if lock.locked():
+            log.warning(
+                "turn_rejected",
+                session_id=sid,
+                owner_id=session.owner_id,
+                reason=SESSION_BUSY_CODE,
             )
-            # "messages" streams model tokens; "updates" yields each finished node's messages,
-            # which is where complete tool calls and tool results appear.
-            async for mode, payload in agent.astream(
-                {"messages": [HumanMessage(text)]},
-                config,
-                stream_mode=["messages", "updates"],
-                context=AgentContext(owner_id=session.owner_id),
-            ):
-                if mode == "updates":
-                    for event in _tool_events(cast(dict[str, Any], payload)):
-                        _log_tool_event(turn_log, event, tool_started)
-                        yield event
-                    continue
-                chunk, _ = cast(tuple[BaseMessage, dict[str, Any]], payload)
-                if not isinstance(chunk, AIMessageChunk):
-                    continue
-                if chunk.usage_metadata:
-                    input_tokens += chunk.usage_metadata["input_tokens"]
-                    output_tokens += chunk.usage_metadata["output_tokens"]
-                # `.text` holds answer text only; thinking arrives as separate reasoning content.
-                if chunk.text:
-                    yield TokenEvent(text=chunk.text)
-        except Exception:
-            turn_log.exception("turn_failed")
-            await self._save_error_reply(agent, config, turn_log)
-            yield ErrorEvent(code=CHAT_FAILED_CODE, message=CHAT_FAILED_MESSAGE)
+            yield ErrorEvent(code=SESSION_BUSY_CODE, message=SESSION_BUSY_MESSAGE)
             return
+        # An uncontended acquire does not yield, so the check above and this acquire are atomic.
+        async with lock:
+            started = time.perf_counter()
+            turn_log = log.bind(session_id=sid, owner_id=session.owner_id)
+            agent = self._agents[model_id]
+            config = _thread_config(session)
+            tool_started: dict[str, float] = {}
+            input_tokens = output_tokens = 0
+            try:
+                prior_turns = sum(t.role == "user" for t in await self.history(session))
+                turn_log.info(
+                    "turn_started",
+                    model_id=model_id,
+                    message_chars=len(text),
+                    prior_turns=prior_turns,
+                )
+                # "messages" streams model tokens; "updates" yields each finished node's messages,
+                # which is where complete tool calls and tool results appear.
+                async for mode, payload in agent.astream(
+                    {"messages": [HumanMessage(text)]},
+                    config,
+                    stream_mode=["messages", "updates"],
+                    context=AgentContext(owner_id=session.owner_id),
+                ):
+                    if mode == "updates":
+                        for event in _tool_events(cast(dict[str, Any], payload)):
+                            _log_tool_event(turn_log, event, tool_started)
+                            yield event
+                        continue
+                    chunk, _ = cast(tuple[BaseMessage, dict[str, Any]], payload)
+                    if not isinstance(chunk, AIMessageChunk):
+                        continue
+                    if chunk.usage_metadata:
+                        input_tokens += chunk.usage_metadata["input_tokens"]
+                        output_tokens += chunk.usage_metadata["output_tokens"]
+                    # `.text` holds answer text only; thinking arrives as reasoning content.
+                    if chunk.text:
+                        yield TokenEvent(text=chunk.text)
+            except Exception:
+                turn_log.exception("turn_failed")
+                await self._save_error_reply(agent, config, turn_log)
+                yield ErrorEvent(code=CHAT_FAILED_CODE, message=CHAT_FAILED_MESSAGE)
+                return
 
-        usage = TurnUsage(
-            session_id=session.id,
-            model_id=model_id,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            latency_ms=round((time.perf_counter() - started) * MS_PER_S),
-        )
-        async with self._uow() as uow:
-            await uow.usage.add(usage)
-            await uow.commit()
-        await self._sessions.title_from_message(session, text)
-        turn_log.info(
-            "turn_done",
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            latency_ms=usage.latency_ms,
-        )
-        yield DoneEvent(
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
-            latency_ms=usage.latency_ms,
-        )
+            usage = TurnUsage(
+                session_id=session.id,
+                model_id=model_id,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                latency_ms=round((time.perf_counter() - started) * MS_PER_S),
+            )
+            async with self._uow() as uow:
+                await uow.usage.add(usage)
+                await uow.commit()
+            await self._sessions.title_from_message(session, text)
+            turn_log.info(
+                "turn_done",
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                latency_ms=usage.latency_ms,
+            )
+            yield DoneEvent(
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                latency_ms=usage.latency_ms,
+            )
 
     @staticmethod
     async def _save_error_reply(

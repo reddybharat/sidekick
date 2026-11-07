@@ -52,10 +52,14 @@ class DocumentRepository(Protocol):
     """Every method is scoped to `owner_id`: another owner's documents behave as missing."""
 
     async def add(
-        self, owner_id: str, filename: str, sha256: str, embedding_model: str
+        self, owner_id: str, filename: str, sha256: str, embedding_model: str, data: bytes
     ) -> Document: ...
 
     async def get_by_sha256(self, owner_id: str, sha256: str) -> Document | None: ...
+
+    async def get_file(self, owner_id: str, document_id: uuid.UUID) -> tuple[str, bytes] | None:
+        """The filename and original bytes, or None when the document or its file is missing."""
+        ...
 
     async def list_by_owner(self, owner_id: str) -> list[Document]: ...
 
@@ -66,6 +70,11 @@ class DocumentRepository(Protocol):
     ) -> None: ...
 
     async def mark_failed(self, document_id: uuid.UUID, error: str) -> None: ...
+
+    async def fail_pending(self, error: str) -> int:
+        """Marks every owner's `pending` documents failed and returns how many. System-level
+        recovery at startup, so not owner-scoped; it returns no document data."""
+        ...
 
     async def search(self, owner_id: str, embedding: list[float], limit: int) -> list[ChunkHit]: ...
 

@@ -45,6 +45,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         container = await Container.build(settings)
         app.state.container = container
         try:
+            # shortcut: assumes one API process; with several workers a starting one would fail
+            # another's in-flight ingestion → job queue.
+            await container.documents.fail_interrupted()
             yield
         finally:
             await container.aclose()

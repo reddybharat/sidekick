@@ -13,7 +13,7 @@ from app.core.errors import (
     NotFoundError,
     PayloadTooLargeError,
 )
-from app.domain.models import ChunkHit, ChunkIn, Document
+from app.domain.models import ChunkHit, ChunkIn, Document, DocumentStatus
 from app.domain.ports import Embedder, UnitOfWork
 
 log = structlog.get_logger()
@@ -24,6 +24,7 @@ EMBED_BATCH_SIZE = 32
 MS_PER_S = 1000
 INGESTION_FAILED_MESSAGE = "Could not read this PDF."
 NO_TEXT_MESSAGE = "No extractable text: the PDF may be scanned images."
+INTERRUPTED_MESSAGE = "Processing was interrupted by a server restart. Upload the file again."
 
 
 class DocumentService:
@@ -46,7 +47,8 @@ class DocumentService:
         self._max_upload_bytes = max_upload_bytes
 
     async def upload(self, filename: str, data: bytes) -> Document:
-        """Validate and register a PDF as `pending`; call `ingest` afterwards."""
+        """Validate and register a PDF as `pending` with its original bytes; call `ingest`
+        afterwards. A `failed` copy of the same PDF is replaced, any other copy is a conflict."""
         if len(data) > self._max_upload_bytes:
             log.warning("upload_rejected", reason="size", filename=filename, bytes=len(data))
             raise PayloadTooLargeError(f"PDF exceeds {self._max_upload_bytes} bytes")
@@ -54,12 +56,21 @@ class DocumentService:
             log.warning("upload_rejected", reason="type", filename=filename, bytes=len(data))
             raise InvalidDocumentError("Only PDF files are supported")
         sha256 = hashlib.sha256(data).hexdigest()
+        replaced: uuid.UUID | None = None
         async with self._uow() as uow:
-            if await uow.documents.get_by_sha256(self._owner_id, sha256) is not None:
-                log.warning("upload_rejected", reason="duplicate", filename=filename)
-                raise ConflictError("This PDF is already in the library")
+            existing = await uow.documents.get_by_sha256(self._owner_id, sha256)
+            if existing is not None:
+                if existing.status != DocumentStatus.FAILED:
+                    log.warning("upload_rejected", reason="duplicate", filename=filename)
+                    raise ConflictError("This PDF is already in the library")
+                await uow.documents.delete(self._owner_id, existing.id)
+                replaced = existing.id
             document = await uow.documents.add(
-                self._owner_id, filename[:MAX_FILENAME_CHARS], sha256, self._embedder.model_name
+                self._owner_id,
+                filename[:MAX_FILENAME_CHARS],
+                sha256,
+                self._embedder.model_name,
+                data,
             )
             await uow.commit()
         log.info(
@@ -68,12 +79,29 @@ class DocumentService:
             owner_id=self._owner_id,
             filename=document.filename,
             bytes=len(data),
+            replaced_document_id=None if replaced is None else str(replaced),
         )
         return document
 
     async def list_documents(self) -> list[Document]:
         async with self._uow() as uow:
             return await uow.documents.list_by_owner(self._owner_id)
+
+    async def file(self, document_id: uuid.UUID) -> tuple[str, bytes]:
+        """The filename and original PDF bytes."""
+        async with self._uow() as uow:
+            found = await uow.documents.get_file(self._owner_id, document_id)
+        if found is None:
+            raise NotFoundError(f"No stored file for document {document_id}")
+        return found
+
+    async def fail_interrupted(self) -> None:
+        """Ingestion runs in the API process, so a `pending` document at startup never finishes."""
+        async with self._uow() as uow:
+            interrupted = await uow.documents.fail_pending(INTERRUPTED_MESSAGE)
+            await uow.commit()
+        emit = log.warning if interrupted else log.info
+        emit("ingestion_interrupted", documents=interrupted)
 
     async def delete(self, document_id: uuid.UUID) -> None:
         async with self._uow() as uow:

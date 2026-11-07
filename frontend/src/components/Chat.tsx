@@ -1,5 +1,6 @@
-import { ArrowRight, Check, ChevronDown, LoaderCircle, X } from 'lucide-react'
-import { type ReactNode, useEffect, useRef, useState } from 'react'
+import { cn } from 'cn'
+import { ArrowRight, Check, ChevronDown, ExternalLink, LoaderCircle, X } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
 import Markdown from 'react-markdown'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
@@ -11,7 +12,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Textarea } from '@/components/ui/textarea'
-import { type ModelInfo, streamMessage } from '@/lib/api'
+import { documentFileUrl, type LibraryDocument, type ModelInfo, streamMessage } from '@/lib/api'
 import { CITATION } from '@/lib/citations'
 
 const MAX_MESSAGE_CHARS = 8000
@@ -20,6 +21,12 @@ const READ_SKILL_FILE = 'read_skill_file'
 const SKILL_FILE_SUFFIX = /\/SKILL\.md$/
 // Link target that marks a rewritten citation; never navigated to.
 const CITE_HREF = '#cite'
+// Backend services/chat.py: SESSION_BUSY_CODE, another tab is answering this session.
+const SESSION_BUSY_CODE = 'session_busy'
+const CHIP =
+  'mx-0.5 inline-flex items-baseline gap-1 border bg-card px-1.5 text-xs leading-5 whitespace-nowrap'
+const NOT_STORED_TITLE = 'Original not stored. Delete and upload again to open it.'
+const NOT_IN_LIBRARY_TITLE = 'This document is no longer in the library.'
 
 export interface ToolStep {
   id: string
@@ -40,7 +47,7 @@ interface Props {
   sessionId: string
   turns: Turn[]
   onTurns: (update: (turns: Turn[]) => Turn[]) => void
-  libraryEmpty: boolean
+  documents: LibraryDocument[]
   models: ModelInfo[]
   modelId: string
   onModelChange: (id: string) => void
@@ -51,7 +58,7 @@ export function Chat({
   sessionId,
   turns,
   onTurns,
-  libraryEmpty,
+  documents,
   models,
   modelId,
   onModelChange,
@@ -70,10 +77,11 @@ export function Chat({
     if (!text || busy || !modelId) return
     setInput('')
     setBusy(true)
+    const questionId = crypto.randomUUID()
     const answerId = crypto.randomUUID()
     onTurns((t) => [
       ...t,
-      { id: crypto.randomUUID(), role: 'user', text, tools: [], skills: [] },
+      { id: questionId, role: 'user', text, tools: [], skills: [] },
       { id: answerId, role: 'assistant', text: '', tools: [], skills: [] },
     ])
     const patch = (fn: (turn: Turn) => Turn) =>
@@ -89,7 +97,12 @@ export function Chat({
           }))
         else if (e.type === 'tool_end')
           patch((x) => ({ ...x, tools: x.tools.map((s) => (s.id === e.id ? { ...s, ok: e.ok } : s)) }))
-        else if (e.type === 'error') patch((x) => ({ ...x, error: e.message }))
+        else if (e.type === 'error' && e.code === SESSION_BUSY_CODE) {
+          // The backend saved nothing for this turn, so the view drops it too and the text returns.
+          onTurns((t) => t.filter((x) => x.id !== questionId && x.id !== answerId))
+          setInput(text)
+          toast.error(e.message)
+        } else if (e.type === 'error') patch((x) => ({ ...x, error: e.message }))
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Connection lost'
@@ -105,7 +118,7 @@ export function Chat({
     <div className="flex h-full flex-col">
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex max-w-[736px] flex-col gap-2.5 px-4 py-7 md:px-7" aria-live="polite">
-          {libraryEmpty ? (
+          {documents.length === 0 ? (
             <p className="text-sm text-muted-foreground">
               Your library is empty. Upload PDFs in Library to ask questions about them.
             </p>
@@ -117,7 +130,11 @@ export function Chat({
             )
           )}
           {turns.map((t) =>
-            t.role === 'user' ? <Question key={t.id} turn={t} /> : <Answer key={t.id} turn={t} />,
+            t.role === 'user' ? (
+              <Question key={t.id} turn={t} />
+            ) : (
+              <Answer key={t.id} turn={t} documents={documents} />
+            ),
           )}
           <div ref={bottom} />
         </div>
@@ -228,18 +245,45 @@ function markCitations(text: string): string {
   })
 }
 
-function CitationChip({ file, pages }: { file: ReactNode; pages: string }) {
+function CitationChip({
+  file,
+  pages,
+  documents,
+}: {
+  file: string
+  pages: string
+  documents: LibraryDocument[]
+}) {
+  // shortcut: matches by filename, first match; two library PDFs with the same name → cite by document id
+  const doc = documents.find((d) => d.status === 'ready' && d.filename === file)
+  // The chip shows only the file name; the cited pages are in its title and the Sources panel.
+  const cited = `${/[-–,]/.test(pages) ? 'pp.' : 'p.'} ${pages}`
+  if (!doc?.has_file)
+    return (
+      <span
+        className={cn(CHIP, 'text-muted-foreground')}
+        title={`${cited} · ${doc ? NOT_STORED_TITLE : NOT_IN_LIBRARY_TITLE}`}
+      >
+        {file}
+      </span>
+    )
+  const page = Number.parseInt(pages, 10)
   return (
-    <span className="mx-0.5 inline-flex items-baseline gap-1 border bg-card px-1.5 text-xs leading-5 whitespace-nowrap text-muted-foreground">
+    <a
+      href={documentFileUrl(doc.id, page)}
+      target="_blank"
+      rel="noreferrer"
+      title={`Open ${file} at page ${page}`}
+      aria-label={`Open ${file} at page ${page} (new tab)`}
+      className={cn(CHIP, 'border-input text-foreground! no-underline! hover:border-primary')}
+    >
       {file}
-      <b className="font-semibold text-primary">
-        {/[-–,]/.test(pages) ? 'pp.' : 'p.'} {pages}
-      </b>
-    </span>
+      <ExternalLink className="size-2.75 self-center text-primary" aria-hidden="true" />
+    </a>
   )
 }
 
-function Answer({ turn }: { turn: Turn }) {
+function Answer({ turn, documents }: { turn: Turn; documents: LibraryDocument[] }) {
   return (
     <div className="flex flex-col gap-2.5">
       {turn.text && (
@@ -249,7 +293,7 @@ function Answer({ turn }: { turn: Turn }) {
             components={{
               a: ({ href, title, children }) =>
                 href === CITE_HREF ? (
-                  <CitationChip file={children} pages={title ?? ''} />
+                  <CitationChip file={[children].flat().join('')} pages={title ?? ''} documents={documents} />
                 ) : (
                   <a href={href} target="_blank" rel="noreferrer">
                     {children}

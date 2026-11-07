@@ -4,7 +4,7 @@ from sqlalchemy import delete, exists, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.models import ChunkHit, ChunkIn, Document, DocumentStatus
-from app.infra.db.orm import ChunkRow, DocumentRow
+from app.infra.db.orm import ChunkRow, DocumentFileRow, DocumentRow
 
 # Keep scanning the HNSW index until `limit` rows pass the owner filter (pgvector >= 0.8).
 ITERATIVE_SCAN_SQL = "SET LOCAL hnsw.iterative_scan = strict_order"
@@ -15,7 +15,7 @@ class SqlDocumentRepository:
         self._db = db
 
     async def add(
-        self, owner_id: str, filename: str, sha256: str, embedding_model: str
+        self, owner_id: str, filename: str, sha256: str, embedding_model: str, data: bytes
     ) -> Document:
         row = DocumentRow(
             owner_id=owner_id,
@@ -26,8 +26,20 @@ class SqlDocumentRepository:
         )
         self._db.add(row)
         await self._db.flush()
+        self._db.add(DocumentFileRow(document_id=row.id, data=data))
+        await self._db.flush()
         await self._db.refresh(row)
         return Document.model_validate(row)
+
+    async def get_file(self, owner_id: str, document_id: uuid.UUID) -> tuple[str, bytes] | None:
+        found = (
+            await self._db.execute(
+                select(DocumentRow.filename, DocumentFileRow.data)
+                .join(DocumentFileRow, DocumentFileRow.document_id == DocumentRow.id)
+                .where(DocumentRow.id == document_id, DocumentRow.owner_id == owner_id)
+            )
+        ).first()
+        return None if found is None else (found.filename, found.data)
 
     async def get_by_sha256(self, owner_id: str, sha256: str) -> Document | None:
         row = await self._db.scalar(
@@ -76,6 +88,15 @@ class SqlDocumentRepository:
             .where(DocumentRow.id == document_id)
             .values(status=DocumentStatus.FAILED, error=error)
         )
+
+    async def fail_pending(self, error: str) -> int:
+        failed = await self._db.scalars(
+            update(DocumentRow)
+            .where(DocumentRow.status == DocumentStatus.PENDING)
+            .values(status=DocumentStatus.FAILED, error=error)
+            .returning(DocumentRow.id)
+        )
+        return len(failed.all())
 
     async def search(self, owner_id: str, embedding: list[float], limit: int) -> list[ChunkHit]:
         await self._db.execute(text(ITERATIVE_SCAN_SQL))

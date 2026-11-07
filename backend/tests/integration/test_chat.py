@@ -1,11 +1,16 @@
+import asyncio
 import json
 import uuid
 from collections.abc import Callable
 
 from fastapi.testclient import TestClient
 
+from app.container import Container
 from app.core.config import Settings
+from app.core.errors import ConflictError
+from app.domain.models import ChatEvent, ErrorEvent
 from app.main import create_app
+from app.services.chat import CHAT_FAILED_CODE, SESSION_BUSY_CODE, SESSION_BUSY_MESSAGE
 
 REJECTED_GROQ_KEY = "not-a-real-key"
 
@@ -165,3 +170,41 @@ def test_a_follow_up_resolves_against_the_earlier_turn(
     answer = "".join(str(d["text"]) for name, d in _events(follow_up.text) if name == "token")
     assert "france" in answer.lower()
     assert [t["role"] for t in history] == ["user", "assistant", "user", "assistant"]
+
+
+def test_a_second_send_to_a_busy_session_is_rejected_and_delete_waits(
+    migrated_database_url: str,
+) -> None:
+    settings = Settings(
+        database_url=migrated_database_url, groq_api_key=REJECTED_GROQ_KEY, log_json=False
+    )
+    with TestClient(create_app(settings)) as client:
+        session_id = client.post("/sessions", json={}).json()["id"]
+        container: Container = client.app.state.container  # type: ignore[attr-defined]
+        chat = container.chat
+        model_id = chat.resolve_model_id(None)
+
+        async def race() -> tuple[list[ChatEvent], bool]:
+            session = await container.sessions.get(uuid.UUID(session_id))
+            first = chat.stream(session, "Hello", model_id)
+            # One loop step runs the first stream up to its first database await, holding the lock.
+            pending = asyncio.ensure_future(anext(first))
+            await asyncio.sleep(0)
+            second = [event async for event in chat.stream(session, "Hello", model_id)]
+            try:
+                await chat.delete_history(session)
+                delete_refused = False
+            except ConflictError:
+                delete_refused = True
+            await pending
+            async for _ in first:  # finish the turn, which releases the lock
+                pass
+            return second, delete_refused
+
+        second, delete_refused = client.portal.call(race)  # type: ignore[union-attr]
+        after = client.post(f"/sessions/{session_id}/messages", json={"text": "Hello"})
+
+    assert second == [ErrorEvent(code=SESSION_BUSY_CODE, message=SESSION_BUSY_MESSAGE)]
+    assert delete_refused
+    # The lock was released: the next send runs (and fails on the rejected key, not as busy).
+    assert [data["code"] for _, data in _events(after.text)] == [CHAT_FAILED_CODE]

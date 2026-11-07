@@ -1,6 +1,6 @@
 import { cn } from 'cn'
 import { PanelLeft, Pencil, Plus, Trash2 } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Chat, type Turn } from '@/components/Chat'
 import { Library } from '@/components/Library'
@@ -11,6 +11,8 @@ import { Toaster } from '@/components/ui/sonner'
 import { api, type LibraryDocument, type ModelInfo, type Session } from '@/lib/api'
 
 const POLL_MS = 2000
+// Backend domain/models.py: MAX_TITLE_CHARS.
+const MAX_TITLE_CHARS = 200
 const MS_PER_DAY = 86_400_000
 const DAY_FORMAT: Intl.DateTimeFormatOptions = { day: 'numeric', month: 'short' }
 
@@ -40,6 +42,8 @@ export default function App() {
   const [models, setModels] = useState<ModelInfo[]>([])
   const [modelId, setModelId] = useState('')
   const [railOpen, setRailOpen] = useState(false)
+  // The session whose title is being edited, and where: its rail row or the header.
+  const [renaming, setRenaming] = useState<{ id: string; place: 'rail' | 'header' } | null>(null)
 
   const refreshSessions = useCallback(
     () => api.listSessions().then(setSessions).catch((e: unknown) => toast.error(errorText(e))),
@@ -91,9 +95,9 @@ export default function App() {
     }
   }
 
-  async function rename(s: Session) {
-    const title = window.prompt('Rename session', s.title)?.trim()
-    if (!title || title === s.title) return
+  async function rename(s: Session, title: string | null) {
+    setRenaming(null)
+    if (title === null) return
     try {
       await api.renameSession(s.id, title)
       await refreshSessions()
@@ -135,6 +139,10 @@ export default function App() {
         setRailOpen(false)
       }}
       onNew={() => void newSession()}
+      renamingId={renaming?.place === 'rail' ? renaming.id : null}
+      onStartRename={(id) => setRenaming({ id, place: 'rail' })}
+      onRename={(s, title) => void rename(s, title)}
+      onDelete={(s) => void remove(s)}
     />
   )
 
@@ -154,9 +162,30 @@ export default function App() {
               {rail}
             </SheetContent>
           </Sheet>
-          <h1 className="truncate text-[15px] font-semibold">
-            {view === 'library' ? 'Library' : (session?.title ?? 'Agentic RAG')}
-          </h1>
+          {view === 'chat' && session && renaming?.id === session.id && renaming.place === 'header' ? (
+            <TitleEditor
+              title={session.title}
+              onDone={(title) => void rename(session, title)}
+              className="-ml-2.25 w-75 px-2 py-1 text-[15px] font-semibold"
+            />
+          ) : (
+            <h1 className="min-w-0 truncate text-[15px] font-semibold">
+              {view === 'library' ? (
+                'Library'
+              ) : session ? (
+                <button
+                  type="button"
+                  title="Rename session"
+                  onClick={() => setRenaming({ id: session.id, place: 'header' })}
+                  className="-mx-1.5 max-w-full truncate px-1.5 py-0.5 outline-none hover:bg-accent/60 focus-visible:ring-3 focus-visible:ring-ring/50"
+                >
+                  {session.title}
+                </button>
+              ) : (
+                'Agentic RAG'
+              )}
+            </h1>
+          )}
           <span className="shrink-0 text-[13px] text-muted-foreground tabular-nums">
             {view === 'library'
               ? `${plural(documents.length, 'document')} · ${plural(pages, 'page')}`
@@ -164,9 +193,6 @@ export default function App() {
           </span>
           {view === 'chat' && session && (
             <span className="ml-auto flex shrink-0 gap-1 text-muted-foreground">
-              <Button variant="ghost" size="icon-sm" aria-label="Rename session" onClick={() => void rename(session)}>
-                <Pencil />
-              </Button>
               <Button variant="ghost" size="icon-sm" aria-label="Delete session" onClick={() => void remove(session)}>
                 <Trash2 />
               </Button>
@@ -182,7 +208,7 @@ export default function App() {
               sessionId={active}
               turns={activeTurns}
               onTurns={(fn) => setTurns((all) => ({ ...all, [active]: fn(all[active] ?? []) }))}
-              libraryEmpty={documents.length === 0}
+              documents={documents}
               models={models}
               modelId={modelId}
               onModelChange={setModelId}
@@ -224,6 +250,10 @@ function Rail({
   onView,
   onOpen,
   onNew,
+  renamingId,
+  onStartRename,
+  onRename,
+  onDelete,
 }: {
   view: View
   sessions: Session[]
@@ -232,6 +262,10 @@ function Rail({
   onView: (view: View) => void
   onOpen: (id: string) => void
   onNew: () => void
+  renamingId: string | null
+  onStartRename: (id: string) => void
+  onRename: (session: Session, title: string | null) => void
+  onDelete: (session: Session) => void
 }) {
   const tabs: { id: View; label: string; count?: number }[] = [
     { id: 'chat', label: 'Chat' },
@@ -274,22 +308,52 @@ function Rail({
         )}
         {sessions.map((s) => {
           const on = view === 'chat' && active === s.id
+          if (renamingId === s.id)
+            return (
+              <div key={s.id} className="px-1 py-0.75">
+                <TitleEditor
+                  title={s.title}
+                  onDone={(title) => onRename(s, title)}
+                  className="w-full px-1.5 py-1 text-sm"
+                />
+              </div>
+            )
+          // Rename and delete show on the active row, and on others while hovered or focused.
           return (
-            <button
+            <div
               key={s.id}
-              type="button"
-              aria-current={on ? 'page' : undefined}
-              onClick={() => onOpen(s.id)}
-              className={cn(
-                'grid grid-cols-[minmax(0,1fr)_auto] items-baseline gap-2 px-2 py-1.75 text-left text-sm outline-none hover:bg-accent/60 focus-visible:ring-3 focus-visible:ring-ring/50',
-                on && 'bg-accent font-semibold hover:bg-accent',
-              )}
+              className={cn('group flex items-center', on ? 'bg-accent font-semibold' : 'hover:bg-accent/60')}
             >
-              <span className="truncate">{s.title}</span>
-              <span className="text-xs font-normal text-muted-foreground tabular-nums">
-                {dayLabel(s.updated_at)}
+              <button
+                type="button"
+                aria-current={on ? 'page' : undefined}
+                onClick={() => onOpen(s.id)}
+                className="grid min-w-0 flex-1 grid-cols-[minmax(0,1fr)_auto] items-baseline gap-2 px-2 py-1.75 text-left text-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+              >
+                <span className="truncate">{s.title}</span>
+                <span
+                  className={cn(
+                    'text-xs font-normal text-muted-foreground tabular-nums',
+                    on ? 'hidden' : 'group-focus-within:hidden group-hover:hidden',
+                  )}
+                >
+                  {dayLabel(s.updated_at)}
+                </span>
+              </button>
+              <span
+                className={cn(
+                  'shrink-0 pr-1 text-muted-foreground',
+                  on ? 'flex' : 'hidden group-focus-within:flex group-hover:flex',
+                )}
+              >
+                <Button variant="ghost" size="icon-xs" aria-label={`Rename ${s.title}`} onClick={() => onStartRename(s.id)}>
+                  <Pencil />
+                </Button>
+                <Button variant="ghost" size="icon-xs" aria-label={`Delete ${s.title}`} onClick={() => onDelete(s)}>
+                  <Trash2 />
+                </Button>
               </span>
-            </button>
+            </div>
           )
         })}
       </div>
@@ -314,5 +378,50 @@ function Rail({
         )}
       </div>
     </nav>
+  )
+}
+
+/** An inline session title box: Enter saves a changed, non-empty title; Esc or leaving it cancels. */
+function TitleEditor({
+  title,
+  onDone,
+  className,
+}: {
+  title: string
+  onDone: (title: string | null) => void
+  className: string
+}) {
+  const [value, setValue] = useState(title)
+  // Enter then blur would otherwise report twice.
+  const finished = useRef(false)
+
+  function finish(save: boolean) {
+    if (finished.current) return
+    finished.current = true
+    const next = value.trim()
+    onDone(save && next && next !== title ? next : null)
+  }
+
+  return (
+    <input
+      autoFocus
+      aria-label="Session title"
+      value={value}
+      maxLength={MAX_TITLE_CHARS}
+      onChange={(e) => setValue(e.target.value)}
+      onFocus={(e) => e.currentTarget.select()}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault()
+          finish(true)
+        } else if (e.key === 'Escape') {
+          // Keeps the mobile rail sheet open.
+          e.stopPropagation()
+          finish(false)
+        }
+      }}
+      onBlur={() => finish(false)}
+      className={cn('min-w-0 border border-primary bg-card text-foreground ring-3 ring-accent outline-none', className)}
+    />
   )
 }

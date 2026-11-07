@@ -1,4 +1,5 @@
 import uuid
+from urllib.parse import quote
 
 from fastapi import APIRouter, BackgroundTasks, Response, UploadFile, status
 
@@ -6,6 +7,8 @@ from app.api.deps import DocumentServiceDep
 from app.api.schemas.documents import DocumentOut
 
 router = APIRouter(prefix="/documents", tags=["documents"])
+
+PDF_MEDIA_TYPE = "application/pdf"
 
 
 @router.post("", status_code=status.HTTP_202_ACCEPTED)
@@ -18,7 +21,8 @@ async def upload_document(
     # after receipt; enforce a body limit at the proxy if this is ever exposed.
     data = await file.read()
     document = await documents.upload(file.filename or "document.pdf", data)
-    # shortcut: FastAPI BackgroundTasks, upgrade to a job queue if ingestion must survive restarts.
+    # shortcut: FastAPI BackgroundTasks; a restart fails in-flight ingestion (marked at startup),
+    # upgrade to a job queue if ingestion must survive restarts.
     background.add_task(documents.ingest, document.id, data)
     return DocumentOut.model_validate(document)
 
@@ -26,6 +30,21 @@ async def upload_document(
 @router.get("")
 async def list_documents(documents: DocumentServiceDep) -> list[DocumentOut]:
     return [DocumentOut.model_validate(d) for d in await documents.list_documents()]
+
+
+@router.get("/{document_id}/file", response_class=Response)
+async def get_document_file(document_id: uuid.UUID, documents: DocumentServiceDep) -> Response:
+    """The original PDF, inline, so the browser's viewer can open it at `#page=N`. 404 for
+    another owner's document or one uploaded before originals were kept."""
+    filename, data = await documents.file(document_id)
+    return Response(
+        data,
+        media_type=PDF_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -1,8 +1,9 @@
 import { cn } from 'cn'
-import { Trash2, Upload } from 'lucide-react'
+import { Trash2, Upload, X } from 'lucide-react'
 import { useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
+import { Progress } from '@/components/ui/progress'
 import {
   Table,
   TableBody,
@@ -16,6 +17,14 @@ import { api, type DocumentStatus, type LibraryDocument } from '@/lib/api'
 interface Props {
   documents: LibraryDocument[]
   onChanged: () => void
+}
+
+/** A file on its way to the library; `fraction` is null while it waits its turn. */
+interface UploadRow {
+  key: string
+  name: string
+  fraction: number | null
+  error?: string
 }
 
 const STATUS: Record<DocumentStatus, { label: string; text: string; dot: string }> = {
@@ -36,15 +45,28 @@ const errorText = (e: unknown): string => (e instanceof Error ? e.message : 'fai
 export function Library({ documents, onChanged }: Props) {
   const input = useRef<HTMLInputElement>(null)
   const [over, setOver] = useState(false)
+  const [uploads, setUploads] = useState<UploadRow[]>([])
+  // Files go up one at a time, across drops too: bounded server memory and meaningful progress.
+  const queue = useRef<Promise<void>>(Promise.resolve())
 
-  async function upload(files: FileList | null) {
+  function upload(files: FileList | null) {
     if (!files) return
-    await Promise.all(
-      [...files].map((f) =>
-        api.uploadDocument(f).catch((e: unknown) => toast.error(`${f.name}: ${errorText(e)}`)),
-      ),
-    )
-    onChanged()
+    const batch = [...files].map((file) => ({ file, key: crypto.randomUUID() }))
+    setUploads((u) => [...u, ...batch.map(({ file, key }) => ({ key, name: file.name, fraction: null }))])
+    const patch = (key: string, change: Partial<UploadRow>) =>
+      setUploads((u) => u.map((x) => (x.key === key ? { ...x, ...change } : x)))
+    queue.current = queue.current.then(async () => {
+      for (const { file, key } of batch) {
+        try {
+          patch(key, { fraction: 0 })
+          await api.uploadDocument(file, (fraction) => patch(key, { fraction }))
+          setUploads((u) => u.filter((x) => x.key !== key))
+          onChanged()
+        } catch (e) {
+          patch(key, { error: errorText(e) })
+        }
+      }
+    })
   }
 
   async function remove(d: LibraryDocument) {
@@ -70,7 +92,7 @@ export function Library({ documents, onChanged }: Props) {
         onDrop={(e) => {
           e.preventDefault()
           setOver(false)
-          void upload(e.dataTransfer.files)
+          upload(e.dataTransfer.files)
         }}
         className={cn(
           'flex flex-wrap items-center gap-3.5 border border-dashed border-input bg-muted px-5 py-4.5 text-sm text-muted-foreground',
@@ -93,10 +115,52 @@ export function Library({ documents, onChanged }: Props) {
         multiple
         hidden
         onChange={(e) => {
-          void upload(e.target.files)
+          upload(e.target.files)
           e.target.value = ''
         }}
       />
+      {uploads.length > 0 && (
+        <ul aria-label="Uploads" className="flex flex-col border bg-card">
+          {uploads.map((u) => (
+            <li key={u.key} className="flex flex-col gap-2 px-3.5 py-2.5 not-first:border-t">
+              <div className="flex items-start gap-3">
+                <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <span className="truncate text-sm font-medium" title={u.name}>
+                    {u.name}
+                  </span>
+                  {u.error && (
+                    <span role="alert" className="text-[12.5px] text-destructive">
+                      {u.error}
+                    </span>
+                  )}
+                </span>
+                {u.error ? (
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    className="-mt-1 -mr-1.5 text-muted-foreground"
+                    aria-label={`Dismiss ${u.name}`}
+                    onClick={() => setUploads((all) => all.filter((x) => x.key !== u.key))}
+                  >
+                    <X />
+                  </Button>
+                ) : (
+                  <span className="text-[12.5px] text-muted-foreground tabular-nums">
+                    {u.fraction === null
+                      ? 'Queued'
+                      : u.fraction < 1
+                        ? `${Math.round(u.fraction * 100)}%`
+                        : 'Processing…'}
+                  </span>
+                )}
+              </div>
+              {!u.error && u.fraction !== null && u.fraction < 1 && (
+                <Progress value={u.fraction * 100} aria-label={`Uploading ${u.name}`} />
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
       {documents.length === 0 ? (
         <p className="text-sm text-muted-foreground">
           No documents yet. Add a PDF to start asking questions about it.

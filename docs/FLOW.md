@@ -53,7 +53,7 @@ $s = (Invoke-RestMethod -Method Post http://localhost:8000/sessions -ContentType
 curl.exe -N -X POST http://localhost:8000/sessions/$s/messages -H "Content-Type: application/json" -d '{\"text\":\"What is the phase two budget?\"}'
 ```
 
-Expect `tool_start`/`tool_end` for `read_skill_file`, then for `retrieve_from_documents`, then `token`… and `done`, with a citation like `(sample.pdf, p. 3)`. Uploading the same file again returns 409; `curl.exe -X DELETE http://localhost:8000/documents/<id>` removes it. Interactive API docs: http://localhost:8000/docs.
+Expect `tool_start`/`tool_end` for `read_skill_file`, then for `retrieve_from_documents`, then `token`… and `done`, with a citation like `(sample.pdf, p. 3)`. Uploading the same file again returns 409 (a `failed` copy is replaced instead); `curl.exe -I http://localhost:8000/documents/<id>/file` gives `200` with `application/pdf` (the stored original); `curl.exe -X DELETE http://localhost:8000/documents/<id>` removes it. Interactive API docs: http://localhost:8000/docs.
 
 Inspect the database with `psql -U app -d agentic_rag`:
 
@@ -92,6 +92,8 @@ ChatService(uow, {model id: agent}, sessions, the saver)
 
 `Container.build` is async: it opens the pool and runs the saver's idempotent `setup()` (the checkpoint tables belong to the saver, not Alembic). `Container.aclose` closes the pool.
 
+4. The lifespan then calls `DocumentService.fail_interrupted`: ingestion runs in the API process, so a document still `pending` at startup was cut off by a restart. Every owner's `pending` rows become `failed` with `INTERRUPTED_MESSAGE` ("Processing was interrupted by a server restart. Upload the file again.") and `ingestion_interrupted` logs how many. This assumes one API process (a `shortcut:` in `main.py`).
+
 Windows: psycopg's async mode cannot run on the default Proactor event loop, so `main.py` switches to the selector policy (tests and scripts). `uvicorn --reload` already uses the selector loop; plain `uvicorn` without `--reload` ignores the policy and would hang on startup.
 
 Startup fails fast on a malformed skill file, or an unknown tool in `allowed-tools`. Routes get services through `api/deps.py` (`request.app.state.container`).
@@ -111,10 +113,12 @@ Startup fails fast on a malformed skill file, or an unknown tool in `allowed-too
 5. An exception during the stream → logged with traceback → the error text is saved as the turn's reply (an `AIMessage` with `additional_kwargs["error_code"]`, written with `aupdate_state(as_node="model")`; if that fails, `history_error_save_failed` is logged) → one `error` event (`chat_failed`); no usage is saved. A client disconnect saves nothing.
 6. On success: insert `turn_usage` → `SessionService.title_from_message` (only while the title is `New chat`: the first message with whitespace collapsed, cut to `SESSION_TITLE_CHARS = 60` with a trailing `…`; no model call) → `done`.
 
+**One turn at a time per session.** Steps 2–6 run while `ChatService.stream` holds the session's `asyncio.Lock` (`ChatService._busy`, a `WeakValueDictionary` keyed by session id, so an entry lives only while a stream holds it). A send to a session whose lock is held logs `turn_rejected` (WARNING, `reason=session_busy`) and gets exactly one `error` event, `session_busy`: "This chat is answering in another tab. Wait for it to finish, then send again." Nothing is saved. The lock is released when the stream ends, fails or the client disconnects. It is per process (a `shortcut:` in `ChatService.__init__`).
+
 ### 3.1 History
 
 - `GET /sessions/{id}/messages` → `ChatService.history`: reads the session's checkpoint (`aget_state`) and returns `[{id, role, text, tools: [{id, name, ok}], skills, error?}]`, oldest first. One user entry per `HumanMessage`; one assistant entry per turn with the concatenated answer text, every tool call (`ok` false when the call has no result), the skills read (from `read_skill_file` paths) and, for a failed turn, `error` instead of text. The session is resolved first (404 for another owner's). No passages are returned.
-- `DELETE /sessions/{id}`: owner check → `ChatService.delete_history` (`adelete_thread`) → delete the session row. History goes first so a failure leaves the session in place and the delete can be retried; nothing is orphaned.
+- `DELETE /sessions/{id}`: owner check → `ChatService.delete_history` (`adelete_thread`; 409 `conflict` "This chat is still answering. Try again when it finishes." while the session's lock is held, because the stream would keep writing to the deleted thread) → delete the session row. History goes first so a failure leaves the session in place and the delete can be retried; nothing is orphaned.
 - The frontend loads these turns once per page load when a session is first opened (`App.tsx`); after that its tab state is current.
 
 ### SSE events
@@ -125,7 +129,7 @@ Startup fails fast on a malformed skill file, or an unknown tool in `allowed-too
 | `tool_end` | `{id, name, ok}` |
 | `token` | `{text}` |
 | `done` | `{input_tokens, output_tokens, latency_ms}` |
-| `error` | `{code, message}` |
+| `error` | `{code, message}`; `code` is `chat_failed` (the turn failed) or `session_busy` (another turn is streaming in this session) |
 
 Order: `tool_start`/`tool_end` and `token` interleaved, then exactly one `done` or `error`. `frontend/src/lib/api.ts: streamMessage` POSTs and parses the stream with `fetch` + `TextDecoderStream` (`EventSource` cannot POST); its API types are hand-written mirrors of the backend schemas.
 
@@ -172,9 +176,11 @@ POST /documents (multipart "file", one file per request)
   services/documents.py: DocumentService.upload
     1. len(data) > MAX_UPLOAD_BYTES       → 413 payload_too_large
     2. not data.startswith(b"%PDF-")      → 422 invalid_document
-    3. sha256 already in the library      → 409 conflict  (also unique on (owner_id, sha256))
-    4. insert documents row, status = pending
-  response 202 {id, filename, status: "pending", ...}
+    3. sha256 already in the library      → status failed: delete that row (same transaction)
+                                            otherwise 409 conflict  (unique on (owner_id, sha256))
+    4. insert documents row (status = pending) + document_files row (the original bytes),
+       one transaction
+  response 202 {id, filename, status: "pending", has_file: true, ...}
   background task: DocumentService.ingest(document_id, data)
     a. infra/rag/pdf_loader.py: load_pdf_pages   pypdf text per page (in a thread)
     b. infra/rag/chunkers.py: split_words         per page
@@ -184,7 +190,9 @@ POST /documents (multipart "file", one file per request)
     any exception                        → logged, status = failed, error = "Could not read this PDF."
 ```
 
-- `GET /documents` lists the library (poll for `pending → ready | failed`). `DELETE /documents/{id}` cascades to chunks (404 for unknown or another owner's).
+- `GET /documents` lists the library (poll for `pending → ready | failed`); each document has `has_file` (`orm.py: DocumentRow.has_file`, an `EXISTS` on `document_files` in every document select). `DELETE /documents/{id}` cascades to chunks and the stored file (404 for unknown or another owner's).
+- **Original PDF:** `document_files(document_id PK → documents ON DELETE CASCADE, data bytea)`, a separate table so lists and searches never load the bytes. `GET /documents/{id}/file` (`DocumentService.file`) returns it inline: `application/pdf`, `Content-Disposition: inline; filename*=UTF-8''<quoted name>`, `X-Content-Type-Options: nosniff`, so the browser's own viewer opens it and honours `#page=N`. 404 for an unknown id, another owner's document, or one uploaded before `0005` (no stored file, `has_file` false).
+- **Restart:** a `pending` document whose ingestion was cut off is marked `failed` at the next startup (section 2), and uploading the same PDF again replaces it (step 3).
 - **Chunking (`split_words`):** chunks never cross a page. Whitespace-split words are packed until the next word would exceed `CHUNK_CHARS = 1000`; the next chunk starts `OVERLAP_WORDS = 30` words back; whitespace is normalised; `ordinal` numbers chunks across the document.
 - pypdf flattens layout and tables; scanned pages give no text (no OCR).
 
@@ -286,9 +294,9 @@ An earlier measurement (2026-10-31, 7 queries, 5-document library) showed `qwen3
 ## 8. Persistence and errors
 
 - **Unit of work** (`infra/db/unit_of_work.py`): each `async with uow()` is one transaction; nothing persists without `commit()`.
-- **Owner scoping:** every repository method filters by `owner_id`; another owner's session or document behaves as missing (404).
+- **Owner scoping:** every repository method filters by `owner_id`; another owner's session or document behaves as missing (404). The two exceptions are system-level and return no document data: `has_other_embedding_model` (readiness) and `fail_pending` (startup recovery).
 - **Checkpoints:** `checkpoints`, `checkpoint_blobs`, `checkpoint_writes`, `checkpoint_migrations`, created by `AsyncPostgresSaver.setup()` at startup (not Alembic), keyed by `thread_id` = session id. The pool is separate from the SQLAlchemy engine because the saver uses psycopg (`Settings.checkpoint_database_url` = `DATABASE_URL` without `+asyncpg`).
-- **Migrations** (`migrations/versions/`): `0001` sessions + `vector` extension, `0002` turn_usage, `0003` documents + chunks, `0004` documents/chunks scoped to the owner. `env.py` is async and reads `DATABASE_URL` unless `sqlalchemy.url` is set (tests set it).
+- **Migrations** (`migrations/versions/`): `0001` sessions + `vector` extension, `0002` turn_usage, `0003` documents + chunks, `0004` documents/chunks scoped to the owner, `0005` `document_files` (original PDFs; earlier documents get no row). `env.py` is async and reads `DATABASE_URL` unless `sqlalchemy.url` is set (tests set it).
 - **Errors:** `core/errors.py: AppError` subclasses become `{"error": {"code", "message"}}`: `AppError` 400 `bad_request`, `NotFoundError` 404, `ConflictError` 409, `PayloadTooLargeError` 413, `UnknownModelError` 422 `unknown_model`, `InvalidDocumentError` 422 `invalid_document`, anything else 500 `internal_error` (logged with traceback). FastAPI validation errors stay 422 with FastAPI's body.
 
 ---
@@ -300,11 +308,13 @@ structlog, console or JSON per `LOG_JSON`; `request_id` on every line of a reque
 | Event | Where | Fields |
 |---|---|---|
 | `http_request` | `main.py` middleware | method, path, status, duration_ms (SSE: time to first byte) |
-| `upload_received` / `upload_rejected` | `DocumentService.upload` | document_id, filename, bytes / reason = size, type, duplicate |
+| `upload_received` / `upload_rejected` | `DocumentService.upload` | document_id, filename, bytes, replaced_document_id (the failed copy it replaced, else null) / reason = size, type, duplicate |
+| `ingestion_interrupted` | `DocumentService.fail_interrupted` (startup) | documents (WARNING when > 0) |
 | `ingestion_started` / `ingestion_done` / `ingestion_failed` | `DocumentService.ingest` | pages, chunks, embed_batches, `load_ms` `chunk_ms` `embed_ms` `store_ms`, total_ms |
 | `document_deleted` | `DocumentService.delete` | document_id |
 | `search_done` | `DocumentService.search` | hits, query_chars, duration_ms |
 | `turn_started` / `turn_done` / `turn_failed` | `ChatService.stream` | session_id, model_id, prior_turns, tokens, latency_ms |
+| `turn_rejected` | `ChatService.stream` | session_id, reason = session_busy (WARNING) |
 | `history_error_save_failed` | `ChatService._save_error_reply` | session_id (ERROR, with traceback; the turn just has no saved reply) |
 | `history_view` | `ConversationView.awrap_model_call` | prior_turns, messages_in, messages_out (DEBUG, every model call) |
 | `model_skipped` | `ModelFactory` (startup) | model_id, provider (no registered provider, e.g. a model whose API key is not set) |
@@ -322,13 +332,13 @@ Tests use `structlog.testing.capture_logs` (`tests/integration/test_logging.py`)
 
 ## 10. Frontend
 
-`frontend/` is a React + Vite SPA (Tailwind, shadcn/ui) calling the backend directly (CORS). `src/lib/api.ts` holds the typed REST calls and `streamMessage`. Layout (`App.tsx`):
-- **rail** (`App.tsx: Rail`, fixed 240 px from `md` up; below that a left `Sheet` opened from the header): Chat / Library switch with the document count, sessions list (title + `Today` / `Yesterday` / date from `updated_at`, new session), library summary by status;
-- **header**: the session title and question count, or `Library` with document and page totals; rename and delete for the open session;
-- **chat** (`components/Chat.tsx`): each question is a heading and its answer sits below it (markdown, raw HTML skipped); under each answer one line lists `Skill <name>` per skill read this turn (from `read_skill_file` `tool_start` args, pre-reads included) and `Tool <name>` with running/✓/✗ per other tool call; the composer holds the textarea, the model picker (id + provider) and Send; hints for an empty library or an empty session;
-- **citations** (`lib/citations.ts: CITATION`, `parseCitations`): `(file.pdf, p. N)` in an answer, also with the filename in backticks and page lists or ranges (`p. 2, 3`, `pp. 4-6`), renders as a page chip (`Chat.tsx: markCitations` rewrites it into a `#cite` markdown link that the renderer draws as a chip);
-- **Sources** (`components/Sources.tsx`, `xl` and up, chat only): per cited document a strip of its pages with the cited ones filled (numbered tiles up to 12 pages, thin ticks up to 60, page list only beyond), the citation count and pages; ready documents not cited are listed under "Searched, not cited". Built from the answer text only; the passages themselves are not shown yet;
-- **Library** (`components/Library.tsx`): drop strip and file picker, multi-file; table with pages, added time (hidden on phones), status dot (Ready / Processing / Failed) and the error under a failed file; polls every 2 s while any document is `pending`; delete.
+`frontend/` is a React + Vite SPA (Tailwind, shadcn/ui) calling the backend directly (CORS). `src/lib/api.ts` holds the typed REST calls and `streamMessage`; every failed call throws `ApiError` with the backend's `error.message` (`api.ts: errorMessage`, falling back to `Request failed (<status>)`), so toasts show the real reason. Layout (`App.tsx`):
+- **rail** (`App.tsx: Rail`, fixed 240 px from `md` up; below that a left `Sheet` opened from the header): Chat / Library switch with the document count, sessions list (title + `Today` / `Yesterday` / date from `updated_at`, new session; the active row, and any row while hovered or focused, shows rename and delete in place of the date), library summary by status;
+- **header**: the session title and question count, or `Library` with document and page totals; clicking the title renames the open session, and a delete button sits on the right. Renaming, from the header or a rail row, swaps the title for an inline box (`App.tsx: TitleEditor`): Enter saves a changed, non-empty title (`PATCH /sessions/{id}`), Esc or leaving the box cancels. Delete asks with the browser's confirm;
+- **chat** (`components/Chat.tsx`): each question is a heading and its answer sits below it (markdown, raw HTML skipped); under each answer one line lists `Skill <name>` per skill read this turn (from `read_skill_file` `tool_start` args, pre-reads included) and `Tool <name>` with running/✓/✗ per other tool call; the composer holds the textarea, the model picker (id + provider) and Send; hints for an empty library or an empty session. A `session_busy` error (another tab is answering this session) removes the question and its placeholder answer, puts the text back in the composer and shows the message as a toast, so the view matches what the backend stored;
+- **citations** (`lib/citations.ts: CITATION`, `parseCitations`): `(file.pdf, p. N)` in an answer, also with the filename in backticks and page lists or ranges (`p. 2, 3`, `pp. 4-6`), renders as a page chip (`Chat.tsx: markCitations` rewrites it into a `#cite` markdown link that the renderer draws as a chip). The chip shows only the file name. `Chat.tsx: CitationChip` looks up a `ready` library document with that filename: when it `has_file`, the chip is a link (↗, titled "Open <file> at page N") that opens `documentFileUrl(id, first cited page)` (`/documents/{id}/file#page=N`) in a new tab, in the browser's PDF viewer; otherwise it stays plain, titled with the cited pages and the reason: "p. N · Original not stored. Delete and upload again to open it." (document found without a file) or "p. N · This document is no longer in the library." (none found);
+- **Sources** (`components/Sources.tsx`, `xl` and up, chat only): per cited document a strip of its pages with the cited ones filled (numbered tiles up to 12 pages, thin ticks up to 60, page list only beyond), the citation count and pages; ready documents not cited are listed under "Also in your library". Built from the answer text only; the passages themselves are not shown yet;
+- **Library** (`components/Library.tsx`): drop strip and file picker, multi-file. Files upload one at a time, across drops too (a promise queue), with `api.uploadDocument` over `XMLHttpRequest` for upload progress; each file gets a row: `Queued` → percent with a shadcn `Progress` bar → `Processing…` at 100% until the 202 → removed, and the library refreshes for that file. A rejected upload keeps its row with the backend's message and a dismiss button. Table with pages, added time (hidden on phones), status dot (Ready / Processing / Failed) and the error under a failed file; polls every 2 s while any document is `pending`; delete.
 
 Theme: all colours are CSS variables in `frontend/src/index.css` (shadcn token names, light in `:root`, dark in `.dark`, which `main.tsx` toggles from `prefers-color-scheme`). Palette is warm-grey neutrals with one indigo accent (`--primary`, also the focus ring); `--accent` is the tinted indigo surface for the active session and session hover; `--success` / `--warning` / `--destructive` colour document status. Corners are `--radius: 0.125rem` (2px), so every shadcn radius scales from it. The face is Albert Sans, loaded from Google Fonts in `frontend/index.html` with the system sans as fallback, so offline use falls back to the system face.
 
@@ -355,10 +365,10 @@ Tests hit **real** Postgres (`TEST_DATABASE_URL`, truncated before each test) an
 | `tests/unit/test_progressive_disclosure.py` | tools hidden until a skill is read; a skill read in an earlier turn unlocks nothing; locked call refused; citation rules live in the skill, tool result is passages only |
 | `tests/unit/test_conversation_view.py` | earlier turns shrink to question + answer, current turn whole, failed/unanswered turns hidden, only the last `history_max_turns` kept |
 | `tests/unit/test_chunkers.py`, `test_model_factory.py` | chunk packing/overlap; catalog validation: Gemini + Groq build, default = first, unregistered provider skipped, duplicate ids and unknown options rejected |
-| `tests/integration/test_documents.py` | upload validation, ingestion, delete cascade, owner isolation, chat answer cites p. 3 via `retrieve_from_documents` |
-| `tests/integration/test_chat.py`, `test_sessions.py`, `test_models.py`, `test_health.py` | SSE turn + usage + first-message title, `model_id` default/selection/rejection, error event, failed turn saved as an error reply and removed with the session, follow-up resolved against the earlier turn (model-dependent), history empty and owner-private, session CRUD, `/models` with and without a key, live Gemini and Groq answers (skip without `GOOGLE_API_KEY` / `GROQ_API_KEY`), `/health` + `/ready` |
+| `tests/integration/test_documents.py` | upload validation, ingestion, delete cascade (chunks and the stored file), owner isolation, the original served back byte-for-byte (`has_file`, 404 for another owner and unknown ids), a pre-`0005` document without a file, startup failing an interrupted `pending` document and the re-upload replacing it, chat answer cites p. 3 via `retrieve_from_documents` |
+| `tests/integration/test_chat.py`, `test_sessions.py`, `test_models.py`, `test_health.py` | SSE turn + usage + first-message title, `model_id` default/selection/rejection, error event, failed turn saved as an error reply and removed with the session, a second send to a busy session rejected with `session_busy` and its history delete refused (rejected Groq key, no quota), follow-up resolved against the earlier turn (model-dependent), history empty and owner-private, session CRUD, `/models` with and without a key, live Gemini and Groq answers (skip without `GOOGLE_API_KEY` / `GROQ_API_KEY`), `/health` + `/ready` |
 | `tests/integration/test_logging.py` | key log events for ingestion and a chat turn |
-| `tests/integration/test_migrations.py` | upgrade → downgrade → upgrade, `0004` backfill and dedupe |
+| `tests/integration/test_migrations.py` | upgrade → downgrade → upgrade over every revision, `0004` backfill and dedupe |
 
 The chat-with-document tests depend on model output and can fail intermittently.
 
@@ -368,14 +378,18 @@ The chat-with-document tests depend on model output and can fail intermittently.
 
 | Shortcut | Limit | Upgrade when |
 |---|---|---|
-| FastAPI `BackgroundTasks` for ingestion | in-flight jobs lost on restart; the row stays `pending` | ingestion must survive restarts → job queue |
+| FastAPI `BackgroundTasks` for ingestion | in-flight jobs are lost on restart; the row is marked `failed` at the next startup and the user uploads again | ingestion must survive restarts → job queue, or resume from `document_files` |
+| Startup fails every `pending` row | assumes one API process; a second worker starting would fail the first one's in-flight ingestion | several workers → job queue |
 | Size check after the body is received | multipart spools the whole upload first | exposed publicly → body limit at the proxy |
 | pypdf text only | no OCR, tables flattened | scanned PDFs matter → OCR loader |
 | Manual model choice | no automatic routing between models | measured need → routing middleware |
 | Skill read by the model itself | every document question costs 3 model calls (read skill, search, answer). Measured 2026-10-31: Gemini 3.5-flash-lite and 3.6-flash read the skill and searched on every document question; the former local `qwen3:4b-instruct` searched 0 of 6, and a `system.md` line naming the skill did not help | check whether the Groq model does; otherwise the tool always available (2 calls, matters for the Gemini daily quota) |
 | Hand-written frontend API types | drift if schemas change | API grows → codegen |
 | Last-K history window | turns older than `HISTORY_MAX_TURNS` are forgotten by the model (the UI still lists them) | long threads matter → summarize older turns in `ConversationView` |
-| One checkpoint thread per session | two tabs sending at once can interleave messages | multi-user or concurrent use → per-session lock |
+| Per-process session lock | one turn at a time per session within one API process; with several workers two turns could still interleave on a checkpoint thread | several workers → Postgres advisory lock |
+| Citation chips match by filename | the first `ready` document with the cited name gets the link; two library PDFs with the same name can open the wrong one | duplicate names matter → cite by document id (P14 passages carry it) |
+| Browser PDF viewer | the cited page opens in a new tab with no passage highlight; documents uploaded before `0005` can't be opened | in-app viewer with passage highlight |
+| PDF served inline from the API origin | the browser's viewer may run JavaScript embedded in an uploaded PDF | real auth or public exposure → separate origin, or `Content-Disposition: attachment` |
 | One error code for failed turns | the saved reply is the generic `chat_failed` text | error classification (P11) |
 | Read skill text stays in the turn | resent on every model call of the turn | long tool loops → evict old skill text |
 | Model may skip retrieval on familiar topics | before the pre-read was removed, "Tell me about chain of thought prompting" answered "no information" without searching; not re-measured | still failing → force a first `retrieve_from_documents` call (`tool_choice`) |

@@ -48,7 +48,7 @@ export function Sources({ turns, documents }: Props) {
         ))}
         {uncited.length > 0 && (
           <div className="flex flex-col gap-1.5 border-t pt-4">
-            <span className="text-xs font-semibold text-muted-foreground">Searched, not cited</span>
+            <span className="text-xs font-semibold text-muted-foreground">Also in your library</span>
             {uncited.map((d) => (
               <div key={d.id} className="flex items-baseline justify-between gap-2 text-[13px]">
                 <span className="truncate" title={d.filename}>
