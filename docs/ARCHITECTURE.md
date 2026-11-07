@@ -1,6 +1,6 @@
 # Architecture
 
-The design and why it is this way. What is implemented right now, file by file, is in [FLOW.md](FLOW.md). Change this file only when the developer approves a design change (see [CLAUDE.md](../CLAUDE.md)).
+The design and why it is this way. What is implemented right now, file by file, is in [FLOW.md](FLOW.md).
 
 ## TL;DR
 

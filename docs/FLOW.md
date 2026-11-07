@@ -3,7 +3,7 @@
 Single source of truth for what is implemented **now**: how a question and an upload move through the backend, which files run, the constants in use, and how to run and test each part.
 
 - The design and its reasons are in [ARCHITECTURE.md](ARCHITECTURE.md). Setup is in [README.md](../README.md).
-- Update this file in the same change as the code (see [CLAUDE.md](../CLAUDE.md), "Definition of done"). Cite code as file plus symbol, never by line number.
+- Update this file in the same change as the code. Cite code as file plus symbol, never by line number.
 
 Paths are relative to `backend/` unless they start with `frontend/`.
 
@@ -40,6 +40,16 @@ The frontend reads `VITE_API_URL` (default `http://localhost:8000`) from `fronte
 
 ### 1.2 Tests
 
+DB tests need a separate, disposable database (migration tests downgrade it to an empty schema). Create it once with `psql -U postgres`:
+
+```sql
+CREATE DATABASE sidekick_test OWNER app;
+\c sidekick_test
+CREATE EXTENSION vector;
+```
+
+`backend/.env.example` already sets `TEST_DATABASE_URL` to it. Live Gemini/Groq tests skip without their key. CI (`.github/workflows/ci.yml`) runs lint, format check, mypy and `pytest -rs` against a `pgvector/pgvector:pg18` container.
+
 | Command (in `backend/`) | Needs | Covers |
 |---|---|---|
 | `uv run pytest tests/unit -q` | nothing | skill loader, agent builder checks, progressive disclosure, conversation view, chunker, model factory |
@@ -68,6 +78,18 @@ SELECT id, filename, status, page_count, error FROM documents;
 SELECT page, ordinal, left(content, 80) FROM chunks ORDER BY document_id, ordinal;
 SELECT model_id, input_tokens, output_tokens, latency_ms FROM turn_usage ORDER BY created_at DESC;
 ```
+
+### 1.4 Develop
+
+| Task | Where | Command |
+|---|---|---|
+| Lint / format / typecheck | `backend/` | `uv run ruff check` · `uv run ruff format` · `uv run mypy` |
+| Run those on every commit | `backend/` | `uv run pre-commit install` (once; hooks in `.pre-commit-config.yaml`) |
+| New migration | `backend/` | `uv run alembic revision -m "<message>"` |
+| Undo last migration | `backend/` | `uv run alembic downgrade -1` |
+| Lint / build UI | `frontend/` | `npm run lint` · `npm run build` |
+| Add a shadcn component | `frontend/` | `npx shadcn@latest add <name>` |
+| Health / readiness | | http://localhost:8000/health, http://localhost:8000/ready |
 
 ---
 
@@ -419,10 +441,10 @@ The chat-with-document tests depend on model output and can fail intermittently.
 | Hand-written frontend API types | drift if schemas change | API grows → codegen |
 | Last-K history window | turns older than `HISTORY_MAX_TURNS` are forgotten by the model (the UI still lists them) | long threads matter → summarize older turns in `ConversationView` |
 | Per-process session lock | one turn at a time per session within one API process; with several workers two turns could still interleave on a checkpoint thread | several workers → Postgres advisory lock |
-| Citation chips match by filename | the first `ready` document with the cited name gets the link; two library PDFs with the same name can open the wrong one | duplicate names matter → cite by document id (P14 passages carry it) |
+| Citation chips match by filename | the first `ready` document with the cited name gets the link; two library PDFs with the same name can open the wrong one | duplicate names matter → cite by document id |
 | Browser PDF viewer | the cited page opens in a new tab with no passage highlight; documents uploaded before `0005` can't be opened | in-app viewer with passage highlight |
 | PDF served inline from the API origin | the browser's viewer may run JavaScript embedded in an uploaded PDF | real auth or public exposure → separate origin, or `Content-Disposition: attachment` |
-| One error code for failed turns | the saved reply is the generic `chat_failed` text | error classification (P11) |
+| One error code for failed turns | the saved reply is the generic `chat_failed` text | specific error codes per failure kind |
 | Read skill text stays in the turn | resent on every model call of the turn | long tool loops → evict old skill text |
 | MCP tools fixed at startup | restart the backend after custom-mcp-server adds, removes or renames a tool | servers change at runtime → reload tools per request |
 | Required MCP servers | the backend does not start without custom-mcp-server, and a server that dies later fails web and weather turns | MCP becomes optional → disable skills whose tools are missing |
