@@ -61,7 +61,7 @@ curl.exe -N -X POST http://localhost:8000/sessions/$s/messages -H "Content-Type:
 
 Expect `tool_start`/`tool_end` for `read_skill_file`, then for `retrieve_from_documents`, then `token`… and `done`, with a citation like `(sample.pdf, p. 3)`. "What's the latest Python release?" should read `searching-the-web/SKILL.md` and call `web_search` (answer cites `[title](url)`); "Weather in Hyderabad?" should read `checking-the-weather/SKILL.md` and call `get_weather`. Uploading the same file again returns 409 (a `failed` copy is replaced instead); `curl.exe -I http://localhost:8000/documents/<id>/file` gives `200` with `application/pdf` (the stored original); `curl.exe -X DELETE http://localhost:8000/documents/<id>` removes it. Interactive API docs: http://localhost:8000/docs.
 
-Inspect the database with `psql -U app -d agentic_rag`:
+Inspect the database with `psql -U app -d sidekick`:
 
 ```sql
 SELECT id, filename, status, page_count, error FROM documents;
