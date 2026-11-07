@@ -182,7 +182,7 @@ export default function App() {
                   {session.title}
                 </button>
               ) : (
-                'Agentic RAG'
+                'Sidekick'
               )}
             </h1>
           )}
@@ -275,7 +275,7 @@ function Rail({
     <nav className="flex w-full min-w-0 flex-col border-r bg-sidebar text-sidebar-foreground" aria-label="Main">
       <div className="flex items-center gap-2 px-4 pt-4 pb-3.5 text-[15px] font-bold tracking-[-0.01em]">
         <span className="size-2.5 bg-primary" aria-hidden="true" />
-        Agentic RAG
+        Sidekick
       </div>
       <div className="mx-3 grid grid-cols-2 border bg-background">
         {tabs.map((t) => (

@@ -52,7 +52,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             await container.aclose()
 
-    app = FastAPI(title="Agentic RAG", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Sidekick", version="0.1.0", lifespan=lifespan)
     register_error_handlers(app)
 
     @app.middleware("http")

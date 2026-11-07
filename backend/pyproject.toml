@@ -1,7 +1,7 @@
 [project]
-name = "agentic-rag"
+name = "sidekick"
 version = "0.1.0"
-description = "Agentic RAG v2 backend"
+description = "Sidekick backend"
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.20.1",
