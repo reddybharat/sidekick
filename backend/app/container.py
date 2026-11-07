@@ -20,6 +20,7 @@ from app.infra.db.unit_of_work import SqlUnitOfWork
 from app.infra.embeddings.ollama import OllamaEmbedder
 from app.infra.llm import gemini, groq
 from app.infra.llm.model_factory import ModelFactory
+from app.infra.mcp.client import load_mcp_tools
 from app.infra.rag.chunkers import split_words
 from app.infra.rag.pdf_loader import load_pdf_pages
 from app.services.chat import ChatService
@@ -51,6 +52,10 @@ class Container:
 
     @classmethod
     async def build(cls, settings: Settings) -> Self:
+        # First, so an unavailable MCP server fails startup before any pool is opened.
+        mcp_tools = await load_mcp_tools(
+            settings.mcp_servers, settings.mcp_api_key, settings.mcp_timeout_s
+        )
         engine = build_engine(settings.database_url)
         checkpoint_pool: AsyncConnectionPool[AsyncConnection[DictRow]] = AsyncConnectionPool(
             settings.checkpoint_database_url, kwargs=CHECKPOINT_CONNECTION_KWARGS, open=False
@@ -87,7 +92,7 @@ class Container:
         )
         system_prompt = _prompt("system")
         catalog = load_skills()
-        tools = [make_retrieve_from_documents(documents.search)]
+        tools = [make_retrieve_from_documents(documents.search), *mcp_tools]
         agents = {
             spec.id: build_agent(
                 model_factory.model(spec.id),

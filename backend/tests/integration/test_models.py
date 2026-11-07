@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
@@ -10,6 +11,7 @@ UNREACHABLE_DATABASE_URL = "postgresql+asyncpg://nobody:nobody@127.0.0.1:1/nothi
 LLM_TIMEOUT_S = 120.0
 
 
+@pytest.mark.usefixtures("mcp_servers")  # the app needs its MCP servers to start
 def test_list_models_without_a_gemini_key_offers_only_groq() -> None:
     app = create_app(Settings(database_url=UNREACHABLE_DATABASE_URL, log_json=False))
     with TestClient(app) as client:
@@ -26,6 +28,7 @@ def test_list_models_without_a_gemini_key_offers_only_groq() -> None:
     ]
 
 
+@pytest.mark.usefixtures("mcp_servers")  # the app needs its MCP servers to start
 def test_list_models_with_a_key_lists_gemini_first_without_options() -> None:
     settings = Settings(
         database_url=UNREACHABLE_DATABASE_URL, google_api_key="not-a-real-key", log_json=False

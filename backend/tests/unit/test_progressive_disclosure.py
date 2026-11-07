@@ -114,7 +114,7 @@ async def test_citation_rules_live_in_the_skill_and_results_are_passages_only() 
     found = await make_retrieve_from_documents(one_hit).ainvoke(args)
     empty = await TOOLS[1].ainvoke(args)
 
-    assert found == f"[report.pdf, page 3] (chunk {hit.chunk_id})\nBudget 4.2 M."
+    assert found == "[report.pdf, page 3]\nBudget 4.2 M."
     assert empty == NO_HITS
     assert "Cite every fact as (filename, p. N)" in RETRIEVING.text
 

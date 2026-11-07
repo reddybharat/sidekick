@@ -39,6 +39,7 @@ class ToolStep(BaseModel):
     id: str
     name: str
     ok: bool
+    args: dict[str, object] = {}
 
 
 class HistoryTurn(BaseModel):

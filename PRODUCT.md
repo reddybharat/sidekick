@@ -12,14 +12,14 @@ Primary audience: reviewers, interviewers and engineers evaluating the project a
 
 ## Product Purpose
 
-A local chat-with-your-PDFs app. One agent answers each question from the owner's document library and cites the pages it used. Success means a first-time evaluator can upload a PDF, get a grounded answer with page citations within minutes, and understand how the agent reached it.
+A local chat-with-your-PDFs app. One agent answers each question from the owner's document library and cites the pages it used; it can also search the web (cited as links) and check the weather. Success means a first-time evaluator can upload a PDF, get a grounded answer with page citations within minutes, and understand how the agent reached it.
 
 ## Positioning
 
 Four claims, all true of this codebase:
 
-- **Trustworthy citations:** answers come only from retrieved passages and cite `(filename, p. N)`. Chunks never cross a page boundary.
-- **Local and private:** PDFs, chunks and embeddings stay on the machine (Postgres + pgvector, Ollama embeddings). Only the question, the session's recent turns and the retrieved passages reach the chat model.
+- **Trustworthy citations:** document facts come only from retrieved passages and cite `(filename, p. N)`; web facts come from search results and cite `[title](url)`. The agent never answers from its own knowledge. Chunks never cross a page boundary.
+- **Local and private:** PDFs, chunks and embeddings stay on the machine (Postgres + pgvector, Ollama embeddings). Only the question, the session's recent turns and the retrieved passages reach the chat model. Web search queries go to Tavily or DuckDuckGo, and weather lookups to WeatherAPI, but documents never leave the machine.
 - **Free tier and model choice:** it runs on free Gemini or Groq models, chosen per message in the chat input.
 - **Transparent agent:** progressive disclosure. The agent reads a skill before it can use that skill's tools, so which skills and tools produced an answer can be shown.
 

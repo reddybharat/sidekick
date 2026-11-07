@@ -3,6 +3,7 @@ import json
 import uuid
 from collections.abc import Callable
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.container import Container
@@ -11,6 +12,9 @@ from app.core.errors import ConflictError
 from app.domain.models import ChatEvent, ErrorEvent
 from app.main import create_app
 from app.services.chat import CHAT_FAILED_CODE, SESSION_BUSY_CODE, SESSION_BUSY_MESSAGE
+
+# The app does not start without its MCP servers.
+pytestmark = pytest.mark.usefixtures("mcp_servers")
 
 REJECTED_GROQ_KEY = "not-a-real-key"
 

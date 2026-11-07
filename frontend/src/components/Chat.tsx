@@ -32,6 +32,7 @@ export interface ToolStep {
   id: string
   name: string
   ok?: boolean
+  args?: Record<string, unknown>
 }
 
 export interface Turn {
@@ -92,7 +93,7 @@ export function Chat({
         else if (e.type === 'tool_start')
           patch((x) => ({
             ...x,
-            tools: [...x.tools, { id: e.id, name: e.name }],
+            tools: [...x.tools, { id: e.id, name: e.name, args: e.args }],
             skills: e.name === READ_SKILL_FILE ? addSkill(x.skills, e.args.path) : x.skills,
           }))
         else if (e.type === 'tool_end')
@@ -333,12 +334,23 @@ function Trace({ skills, tools }: { skills: string[]; tools: ToolStep[] }) {
           Skill <code className="font-mono text-[11.5px] text-foreground/75">{name}</code>
         </span>
       ))}
-      {tools.map((s) => (
-        <span key={s.id} className="inline-flex items-center gap-1">
-          Tool <code className="font-mono text-[11.5px] text-foreground/75">{s.name}</code>
-          <StepState ok={s.ok} />
-        </span>
-      ))}
+      {tools.map((s) => {
+        // The query or city, so repeated calls of one tool read as different searches.
+        const input = Object.values(s.args ?? {})
+          .filter((v) => typeof v === 'string')
+          .join(', ')
+        return (
+          <span key={s.id} className="inline-flex min-w-0 items-center gap-1">
+            Tool <code className="font-mono text-[11.5px] text-foreground/75">{s.name}</code>
+            {input && (
+              <span className="max-w-[40ch] truncate" title={input}>
+                “{input}”
+              </span>
+            )}
+            <StepState ok={s.ok} />
+          </span>
+        )
+      })}
     </div>
   )
 }

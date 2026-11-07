@@ -1,6 +1,6 @@
 # Agentic RAG
 
-Chat with your PDFs, locally. One agent on a Gemini free-tier or Groq model (picked in the chat input) answers from a document library in Postgres + pgvector and cites pages. The agent starts with a small base prompt and an index of skills, and reads a skill before it can use that skill's tools.
+Chat with your PDFs, locally. One agent on a Gemini free-tier or Groq model (picked in the chat input) answers from a document library in Postgres + pgvector and cites pages. It can also search the web and check the weather through MCP tools served by [custom-mcp-server](https://github.com/reddybharat/custom-mcp-server). The agent starts with a small base prompt and an index of skills, and reads a skill before it can use that skill's tools.
 
 **Stack:** FastAPI · LangChain/LangGraph · Gemini (`gemini-3.5-flash-lite` default) · Groq (`qwen/qwen3.8-27b`) · Ollama (`qwen3-embedding:0.6b`) · PostgreSQL 18 + pgvector · Alembic · uv · React + Vite + Tailwind + shadcn/ui
 
@@ -66,10 +66,17 @@ For the Gemini chat models, create a free key at https://aistudio.google.com/api
 
 For the Groq chat models, create a key at https://console.groq.com/keys and set `GROQ_API_KEY` in `backend/.env`. The question and the retrieved passages are sent to Groq. Set at least one of `GOOGLE_API_KEY` / `GROQ_API_KEY`; the app does not start without a chat model.
 
-### 6. Project
+### 6. custom-mcp-server (required)
+The backend loads its web search and weather tools from custom-mcp-server at startup and does not start without it. In that repo, follow its README (Python 3.12+, `pip install -r requirements.txt`, `.env` with `MCP_API_KEY`, `WEATHER_API_KEY`, and optionally `TAVILY_API_KEY`), then run it on port 8001 (agentic-rag's API uses 8000):
+```powershell
+uvicorn main:app --port 8001
+```
+In `backend/.env`, set `MCP_API_KEY` to the same value. `MCP_SERVERS` in `.env.example` already points at `http://127.0.0.1:8001/search/mcp` and `/weather/mcp`. Web search queries go to Tavily or DuckDuckGo, and cities to WeatherAPI; documents never leave the machine.
+
+### 7. Project
 ```powershell
 cd backend
-copy .env.example .env      # adjust passwords if you changed them
+copy .env.example .env      # adjust passwords if you changed them; set MCP_API_KEY
 uv sync
 uv run alembic upgrade head
 uv run pre-commit install
@@ -83,6 +90,7 @@ npm install
 
 | Task | Where | Command |
 |---|---|---|
+| MCP tools (first) | custom-mcp-server | `uvicorn main:app --port 8001` |
 | API (reload) | `backend/` | `uv run uvicorn app.main:create_app --factory --reload` |
 | UI | `frontend/` | `npm run dev` → http://localhost:5173 |
 | Health / readiness | | http://localhost:8000/health, http://localhost:8000/ready |

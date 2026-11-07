@@ -10,8 +10,7 @@ import yaml
 SKILLS_DIR = Path(__file__).parent / "skills"
 SKILL_FILE = "SKILL.md"
 FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n(.*)\Z", re.DOTALL)
-INDEX_HEADER = "## Skills"
-INDEX_INTRO = "Available skills:"
+SKILLS_PLACEHOLDER = "{skills}"
 
 log = structlog.get_logger()
 
@@ -30,12 +29,15 @@ class SkillCatalog:
     skills: dict[str, Skill]
 
     def system_prompt(self, base: str) -> str:
-        """Base prompt plus the skill index (name, path, description, tools per skill)."""
+        """Base prompt with the skill index (name, path, description, tools per skill) in place
+        of `{skills}`. `str.replace`, not `format`, so other braces in the prompt are safe."""
+        if SKILLS_PLACEHOLDER not in base:
+            raise ValueError(f"system prompt has no {SKILLS_PLACEHOLDER} placeholder")
         index = "\n".join(
             f"- {s.name} (`{s.path}`): {s.description} Tools: {' '.join(s.allowed_tools)}"
             for s in self.skills.values()
         )
-        return f"{base.strip()}\n\n{INDEX_HEADER}\n{INDEX_INTRO}\n{index}\n"
+        return base.replace(SKILLS_PLACEHOLDER, index)
 
 
 def _load_skill(path: Path, root: Path) -> Skill:

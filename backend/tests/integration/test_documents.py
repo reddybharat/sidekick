@@ -4,12 +4,16 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.container import Container
 from app.core.config import Settings
 from app.main import create_app
 from app.services.documents import INTERRUPTED_MESSAGE
+
+# The app does not start without its MCP servers.
+pytestmark = pytest.mark.usefixtures("mcp_servers")
 
 SAMPLE_PDF = Path(__file__).parents[1] / "fixtures" / "sample.pdf"
 PDF_TYPE = "application/pdf"

@@ -1,4 +1,5 @@
-"""Local tools. MCP tools will join these later; skills unlock either kind by name."""
+"""Local tools. MCP tools (`infra/mcp/client.py`) join them in `build_agent`; skills unlock
+either kind by name."""
 
 from collections.abc import Awaitable, Callable
 
@@ -25,7 +26,7 @@ def make_read_skill_file(catalog: SkillCatalog) -> BaseTool:
 
     @tool(READ_SKILL_FILE)
     def read_skill_file(path: str) -> str:
-        """Read a skill listed under '## Skills', e.g. `retrieving-from-documents/SKILL.md`.
+        """Read a skill from the skill list, e.g. `retrieving-from-documents/SKILL.md`.
         Read it before using the tools it describes."""
         text = files.get(path.strip())
         if text is None:
@@ -38,7 +39,8 @@ def make_read_skill_file(catalog: SkillCatalog) -> BaseTool:
 
 
 def _format(hit: ChunkHit) -> str:
-    lines = [f"[{hit.filename}, page {hit.page}] (chunk {hit.chunk_id})", hit.content]
+    # No chunk id in the header: models copied it into citations, which broke "(file, p. N)".
+    lines = [f"[{hit.filename}, page {hit.page}]", hit.content]
     if hit.context_before:
         lines.append(f"Context before: …{hit.context_before[-CONTEXT_CHARS:]}")
     if hit.context_after:

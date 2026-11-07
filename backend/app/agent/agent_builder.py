@@ -28,8 +28,13 @@ def build_agent(
     checkpointer: BaseCheckpointSaver[Any],
     history_max_turns: int,
 ) -> Agent:
+    all_tools = [make_read_skill_file(catalog), *tools]
+    names = [t.name for t in all_tools]
+    duplicates = {n for n in names if names.count(n) > 1}
+    if duplicates:
+        raise ValueError(f"duplicate tool names: {sorted(duplicates)}")
     named = {t for s in catalog.skills.values() for t in s.allowed_tools}
-    missing = named - {t.name for t in tools}
+    missing = named - set(names)
     if missing:
         raise ValueError(f"skills name unknown tools: {sorted(missing)}")
     middleware: list[AgentMiddleware[Any, AgentContext, Any]] = [
@@ -40,7 +45,7 @@ def build_agent(
     ]
     return create_agent(
         model,
-        tools=[make_read_skill_file(catalog), *tools],
+        tools=all_tools,
         system_prompt=catalog.system_prompt(system_prompt),
         middleware=middleware,
         context_schema=AgentContext,

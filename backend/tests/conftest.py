@@ -12,6 +12,7 @@ from sqlalchemy import text
 from app.infra.db.engine import build_engine
 
 OLLAMA_PROBE_TIMEOUT_S = 0.5
+MCP_PROBE_TIMEOUT_S = 0.5
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 
 
@@ -22,6 +23,7 @@ class _TestSettings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     google_api_key: str | None = None
     groq_api_key: str | None = None
+    mcp_servers: dict[str, str] = {}
 
 
 # Read once at import, before the autouse fixture below overrides the variables for every test.
@@ -99,3 +101,17 @@ def ollama_base_url() -> str:
     except httpx.HTTPError:
         pytest.skip(f"Ollama not reachable at {url}")
     return url
+
+
+@pytest.fixture
+def mcp_servers() -> dict[str, str]:
+    """The configured MCP servers; skips unless every one answers HTTP (any status)."""
+    servers = _TestSettings().mcp_servers
+    if not servers:
+        pytest.skip("MCP_SERVERS not set: the app needs custom-mcp-server to start")
+    for name, url in servers.items():
+        try:
+            httpx.get(url, timeout=MCP_PROBE_TIMEOUT_S)
+        except httpx.HTTPError:
+            pytest.skip(f"MCP server {name!r} not reachable at {url}")
+    return servers

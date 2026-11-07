@@ -209,7 +209,9 @@ def _history_entries(turn: list[AnyMessage]) -> list[HistoryTurn]:
                 text += message.text
             for call in message.tool_calls:
                 call_id = call["id"] or ""
-                tools[call_id] = ToolStep(id=call_id, name=call["name"], ok=False)
+                tools[call_id] = ToolStep(
+                    id=call_id, name=call["name"], ok=False, args=call["args"]
+                )
                 skill = str(call["args"].get("path", "")).strip().removesuffix(SKILL_FILE_SUFFIX)
                 if call["name"] == READ_SKILL_FILE and skill and skill not in skills:
                     skills.append(skill)

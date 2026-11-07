@@ -4,7 +4,7 @@ The design and why it is this way. What is implemented right now, file by file, 
 
 ## TL;DR
 
-- **What:** chat with your PDFs. One agent on a Gemini free-tier or Groq model (chosen per message) answers from a per-owner document library in Postgres + pgvector and cites pages.
+- **What:** chat with your PDFs. One agent on a Gemini free-tier or Groq model (chosen per message) answers from a per-owner document library in Postgres + pgvector and cites pages. Web search and weather come from MCP servers (custom-mcp-server), required at startup.
 - **Progressive disclosure:** the model starts with a small base system prompt and a one-line index of skills. It reads a skill (`read_skill_file`) before it can use the skill's tools.
 - **Layers:** `api → services → domain ← infra`, with `agent` depending only on domain ports. `container.py` is the only module that wires concrete classes.
 - **Compact history:** a session's conversation is checkpointed in Postgres. The model sees only the last few earlier questions and answers plus the current turn, never old tool calls or passages.
@@ -28,7 +28,8 @@ flowchart LR
     gemini["Google Gemini API<br/>(free tier, chat models)"]
     groq["Groq API<br/>(chat models)"]
 
-    mcp["MCP servers<br/>(later)"]
+    mcp["custom-mcp-server<br/>/search/mcp · /weather/mcp"]
+    web["Tavily / DuckDuckGo<br/>WeatherAPI"]
 
     user --> ui
     ui -- "REST + SSE" --> api
@@ -36,7 +37,8 @@ flowchart LR
     api -- "localhost:11434" --> ollama
     api -- "question + retrieved passages" --> gemini
     api -- "question + retrieved passages" --> groq
-    api -. "tools (later)" .-> mcp
+    api -- "MCP tools over streamable HTTP<br/>(X-API-Key)" --> mcp
+    mcp -- "search query, city" --> web
 ```
 
 Everything runs natively; there is no Docker locally. Ollama uses the GPU directly, and Postgres runs as a Windows service with pgvector built from source. CI uses a `pgvector/pgvector:pg18` container.
@@ -51,7 +53,7 @@ flowchart TB
     services["<b>services/</b><br/>ChatService · SessionService · DocumentService<br/><i>use cases</i>"]
     agent["<b>agent/</b><br/>build_agent · skills · tools · ProgressiveDisclosure<br/><i>agent loop</i>"]
     domain["<b>domain/</b><br/>models · ports (Protocols)<br/><i>no I/O</i>"]
-    infra["<b>infra/</b><br/>db · llm · embeddings · rag<br/><i>adapters, I/O only</i>"]
+    infra["<b>infra/</b><br/>db · llm · embeddings · rag · mcp<br/><i>adapters, I/O only</i>"]
     container{{"<b>container.py</b><br/>composition root"}}
 
     api --> services
@@ -71,7 +73,7 @@ flowchart TB
 | `services/` | Use cases: chat turn, session CRUD, ingestion, search | Import concrete adapters |
 | `agent/` | Agent assembly, middleware, skills, local tools | Import concrete adapters |
 | `domain/` | Entities, value objects, ports | Do I/O |
-| `infra/` | Postgres, pgvector, Ollama, PDF parsing | Decide anything beyond translating I/O |
+| `infra/` | Postgres, pgvector, Ollama, PDF parsing, the MCP client (`mcp/client.py: load_mcp_tools` returns `BaseTool`s that `container.py` passes to `build_agent`) | Decide anything beyond translating I/O |
 
 | Port (`domain/ports.py`) | Adapter (`infra/`) |
 |---|---|
@@ -119,9 +121,9 @@ sequenceDiagram
 | Layer | Source | The model sees it |
 |---|---|---|
 | L0 base prompt | `agent/prompts/system.md` | Always, as the start of the system prompt |
-| Skill index | frontmatter of every `agent/skills/<name>/SKILL.md` | Always, appended to the base prompt: one line per skill (name, path, description, tools) |
+| Skill index | frontmatter of every `agent/skills/<name>/SKILL.md` | Always, in place of `{skills}` in the base prompt: one line per skill (name, path, description, tools). Descriptions say what a skill does; which source to prefer is a base-prompt rule |
 | L1 skill | `agent/skills/<name>/SKILL.md` | After `read_skill_file("<name>/SKILL.md")` returns it as a tool result. Reading it unlocks the tools in its `allowed-tools` |
-| Tools | local (`agent/tools.py`), MCP later | Only when unlocked by a read skill |
+| Tools | local (`agent/tools.py`) and MCP (loaded once at startup; an unreachable server or a skill naming a missing tool fails startup) | Only when unlocked by a read skill |
 
 ```mermaid
 stateDiagram-v2
@@ -237,12 +239,10 @@ Planned enhancements and where each plugs in:
 
 | Enhancement | Extension point |
 |---|---|
-| MCP tools | MCP client tools passed to `build_agent` next to the local ones, unlocked by `allowed-tools` like any tool |
 | More skills | A new `agent/skills/<name>/SKILL.md` |
 | Longer memory than the last few turns | Summarization in `ConversationView` (older turns are forgotten today) |
 | Human approval for tools | Human-in-the-loop middleware (the checkpointer already exists) |
 | Long-term memory | Memory tools + a skill that lists them + a `memories` table |
-| Web search | Search tools + a skill that lists them |
 | Agent profiles, auto routing | Routing middleware choosing a model per call (today the user picks the model) |
 | More chat providers | New provider registered in `ModelFactory` (Gemini and Groq were added) |
 | Tracing + evals | Langfuse callback handler; eval datasets |
