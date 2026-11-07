@@ -1,9 +1,8 @@
-import { ChevronDown, ChevronRight, Send } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { ArrowRight, Check, ChevronDown, LoaderCircle, X } from 'lucide-react'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
 import Markdown from 'react-markdown'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -13,11 +12,14 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Textarea } from '@/components/ui/textarea'
 import { type ModelInfo, streamMessage } from '@/lib/api'
+import { CITATION } from '@/lib/citations'
 
 const MAX_MESSAGE_CHARS = 8000
 // Skills reach the agent as read_skill_file calls (pre-reads included) with args.path = '<name>/SKILL.md'.
 const READ_SKILL_FILE = 'read_skill_file'
 const SKILL_FILE_SUFFIX = /\/SKILL\.md$/
+// Link target that marks a rewritten citation; never navigated to.
+const CITE_HREF = '#cite'
 
 export interface ToolStep {
   id: string
@@ -102,55 +104,68 @@ export function Chat({
   return (
     <div className="flex h-full flex-col">
       <div className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto flex max-w-3xl flex-col gap-6 px-4 py-6">
-          {libraryEmpty && (
+        <div className="mx-auto flex max-w-[736px] flex-col gap-2.5 px-4 py-7 md:px-7" aria-live="polite">
+          {libraryEmpty ? (
             <p className="text-sm text-muted-foreground">
               Your library is empty. Upload PDFs in Library to ask questions about them.
             </p>
+          ) : (
+            turns.length === 0 && (
+              <p className="text-sm text-muted-foreground">
+                Ask a question about your documents. Answers cite the pages they come from.
+              </p>
+            )
           )}
           {turns.map((t) =>
-            t.role === 'user' ? <UserTurn key={t.id} turn={t} /> : <AnswerTurn key={t.id} turn={t} />,
+            t.role === 'user' ? <Question key={t.id} turn={t} /> : <Answer key={t.id} turn={t} />,
           )}
           <div ref={bottom} />
         </div>
       </div>
-      <div className="border-t p-4">
+      <div className="px-4 pt-3 pb-5 md:px-7">
         <form
-          className="mx-auto flex max-w-3xl flex-col gap-2"
+          className="mx-auto max-w-[680px] border border-input bg-card transition-shadow focus-within:border-primary focus-within:ring-3 focus-within:ring-accent"
           onSubmit={(e) => {
             e.preventDefault()
             void send()
           }}
         >
-          <div className="flex items-end gap-2">
-            <Textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault()
-                  void send()
-                }
-              }}
-              placeholder="Ask about your documents…"
-              maxLength={MAX_MESSAGE_CHARS}
-              className="max-h-40 min-h-10 resize-none"
-              rows={1}
-            />
+          <Textarea
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault()
+                void send()
+              }
+            }}
+            placeholder="Ask about your documents"
+            aria-label="Question"
+            maxLength={MAX_MESSAGE_CHARS}
+            className="max-h-48 min-h-12 resize-none border-0 bg-transparent px-3.5 pt-3 focus-visible:ring-0 dark:bg-transparent"
+            rows={1}
+          />
+          <div className="flex items-center gap-2.5 px-2 pt-1 pb-2">
+            <ModelPicker models={models} modelId={modelId} onChange={onModelChange} disabled={busy} />
+            <span className="ml-auto hidden text-xs text-muted-foreground sm:inline">
+              Enter to send · Shift+Enter for a new line
+            </span>
             <Button
               type="submit"
-              size="icon"
+              className="ml-auto font-semibold sm:ml-0"
               disabled={busy || !modelId || !input.trim()}
-              aria-label="Send"
             >
-              <Send />
+              Send <ArrowRight />
             </Button>
           </div>
-          <ModelPicker models={models} modelId={modelId} onChange={onModelChange} disabled={busy} />
         </form>
       </div>
     </div>
   )
+}
+
+function providerLabel(provider: string): string {
+  return provider === 'groq' ? 'Groq' : 'Google'
 }
 
 function ModelPicker({
@@ -164,20 +179,15 @@ function ModelPicker({
   onChange: (id: string) => void
   disabled: boolean
 }) {
-  if (models.length === 0) return null
+  const current = models.find((m) => m.id === modelId)
+  if (!current) return null
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="self-start text-xs text-muted-foreground"
-          disabled={disabled}
-          aria-label="Choose model"
-        >
-          {modelId}
-          <ChevronDown />
+        <Button type="button" variant="outline" size="xs" disabled={disabled} aria-label="Choose model">
+          {current.id}
+          <span className="text-muted-foreground">{providerLabel(current.provider)}</span>
+          <ChevronDown className="text-muted-foreground" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start">
@@ -186,7 +196,7 @@ function ModelPicker({
             <DropdownMenuRadioItem key={m.id} value={m.id}>
               {m.id}
               <span className="ml-auto pl-4 text-xs text-muted-foreground">
-                {m.provider === 'groq' ? 'Groq' : 'Google'}
+                {providerLabel(m.provider)}
               </span>
             </DropdownMenuRadioItem>
           ))}
@@ -201,57 +211,90 @@ function addSkill(skills: string[], path: unknown): string[] {
   return !name || skills.includes(name) ? skills : [...skills, name]
 }
 
-function UserTurn({ turn }: { turn: Turn }) {
+function Question({ turn }: { turn: Turn }) {
   return (
-    <p className="ml-auto max-w-[85%] whitespace-pre-wrap rounded-lg bg-muted px-3 py-2 text-sm">
+    <h2 className="mt-4 border-t pt-6 text-[15.5px] leading-snug font-semibold tracking-[-0.005em] whitespace-pre-wrap first:mt-0 first:border-t-0 first:pt-0">
       {turn.text}
-    </p>
+    </h2>
   )
 }
 
-function AnswerTurn({ turn }: { turn: Turn }) {
+/** Rewrites "(file.pdf, p. N)" as a markdown link the renderer turns into a page chip; this also
+ * catches citations whose filename the model wrapped in backticks. */
+function markCitations(text: string): string {
+  return text.replace(CITATION, (_, file: string, pages: string) => {
+    const list = pages.replace(/\s+/g, ' ').replace(/\s*,\s*/g, ', ')
+    return `[${file.trim()}](${CITE_HREF} "${list}")`
+  })
+}
+
+function CitationChip({ file, pages }: { file: ReactNode; pages: string }) {
   return (
-    <div className="flex flex-col gap-2 text-sm">
+    <span className="mx-0.5 inline-flex items-baseline gap-1 border bg-card px-1.5 text-xs leading-5 whitespace-nowrap text-muted-foreground">
+      {file}
+      <b className="font-semibold text-primary">
+        {/[-–,]/.test(pages) ? 'pp.' : 'p.'} {pages}
+      </b>
+    </span>
+  )
+}
+
+function Answer({ turn }: { turn: Turn }) {
+  return (
+    <div className="flex flex-col gap-2.5">
       {turn.text && (
-        <div className="space-y-3 leading-relaxed [&_a]:underline [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_ol]:list-decimal [&_ol]:pl-5 [&_pre]:overflow-x-auto [&_pre]:rounded [&_pre]:bg-muted [&_pre]:p-3 [&_ul]:list-disc [&_ul]:pl-5">
-          <Markdown skipHtml>{turn.text}</Markdown>
+        <div className="max-w-[66ch] space-y-3 text-sm leading-relaxed [&_a]:text-primary [&_a]:underline [&_a]:underline-offset-2 [&_code]:bg-muted [&_code]:px-1 [&_ol]:list-decimal [&_ol]:pl-5 [&_pre]:overflow-x-auto [&_pre]:bg-muted [&_pre]:p-3 [&_ul]:list-disc [&_ul]:pl-5">
+          <Markdown
+            skipHtml
+            components={{
+              a: ({ href, title, children }) =>
+                href === CITE_HREF ? (
+                  <CitationChip file={children} pages={title ?? ''} />
+                ) : (
+                  <a href={href} target="_blank" rel="noreferrer">
+                    {children}
+                  </a>
+                ),
+            }}
+          >
+            {markCitations(turn.text)}
+          </Markdown>
         </div>
       )}
-      {turn.error && <p className="text-destructive">{turn.error}</p>}
-      {!turn.text && !turn.error && <p className="text-muted-foreground">Thinking…</p>}
-      <Steps skills={turn.skills} tools={turn.tools.filter((s) => s.name !== READ_SKILL_FILE)} />
+      {turn.error && <p className="text-sm text-destructive">{turn.error}</p>}
+      {!turn.text && !turn.error && (
+        <p className="text-sm text-muted-foreground motion-safe:animate-pulse">Thinking…</p>
+      )}
+      <Trace skills={turn.skills} tools={turn.tools.filter((s) => s.name !== READ_SKILL_FILE)} />
     </div>
   )
 }
 
-function plural(n: number, word: string): string {
-  return `${n} ${word}${n === 1 ? '' : 's'}`
+function StepState({ ok }: { ok?: boolean }) {
+  if (ok === undefined)
+    return <LoaderCircle className="size-3.5 motion-safe:animate-spin" aria-label="running" />
+  return ok ? (
+    <Check className="size-3.5 text-success" aria-label="succeeded" />
+  ) : (
+    <X className="size-3.5 text-destructive" aria-label="failed" />
+  )
 }
 
-function Steps({ skills, tools }: { skills: string[]; tools: ToolStep[] }) {
+function Trace({ skills, tools }: { skills: string[]; tools: ToolStep[] }) {
   if (skills.length === 0 && tools.length === 0) return null
-  const summary = [
-    skills.length > 0 && plural(skills.length, 'skill'),
-    tools.length > 0 && plural(tools.length, 'tool'),
-  ]
-    .filter(Boolean)
-    .join(' · ')
   return (
-    <Collapsible>
-      <CollapsibleTrigger className="group flex items-center gap-1 text-xs text-muted-foreground">
-        <ChevronRight className="size-3 transition-transform group-data-[state=open]:rotate-90" />
-        {summary}
-      </CollapsibleTrigger>
-      <CollapsibleContent className="mt-1 space-y-0.5 pl-4 text-xs text-muted-foreground">
-        {skills.map((name) => (
-          <div key={name}>skill: {name}</div>
-        ))}
-        {tools.map((s) => (
-          <div key={s.id}>
-            tool: {s.name} {s.ok === undefined ? '…' : s.ok ? '✓' : '✗'}
-          </div>
-        ))}
-      </CollapsibleContent>
-    </Collapsible>
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+      {skills.map((name) => (
+        <span key={name}>
+          Skill <code className="font-mono text-[11.5px] text-foreground/75">{name}</code>
+        </span>
+      ))}
+      {tools.map((s) => (
+        <span key={s.id} className="inline-flex items-center gap-1">
+          Tool <code className="font-mono text-[11.5px] text-foreground/75">{s.name}</code>
+          <StepState ok={s.ok} />
+        </span>
+      ))}
+    </div>
   )
 }

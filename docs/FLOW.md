@@ -322,10 +322,15 @@ Tests use `structlog.testing.capture_logs` (`tests/integration/test_logging.py`)
 
 ## 10. Frontend
 
-`frontend/` is a React + Vite SPA (Tailwind, shadcn/ui) calling the backend directly (CORS). `src/lib/api.ts` holds the typed REST calls and `streamMessage`. Views:
-- sessions sidebar (new, rename, delete);
-- chat: markdown with raw HTML skipped; under each answer one collapsed line such as `1 skill · 2 tools`, which expands to `skill: <name>` per skill read this turn (from `read_skill_file` `tool_start` args, pre-reads included) and `tool: <name> …/✓/✗` per other tool call; a one-line hint when the library is empty;
-- Library: drop zone or picker, multi-file, per-file status, polls every 2 s while any document is `pending`, delete.
+`frontend/` is a React + Vite SPA (Tailwind, shadcn/ui) calling the backend directly (CORS). `src/lib/api.ts` holds the typed REST calls and `streamMessage`. Layout (`App.tsx`):
+- **rail** (`App.tsx: Rail`, fixed 240 px from `md` up; below that a left `Sheet` opened from the header): Chat / Library switch with the document count, sessions list (title + `Today` / `Yesterday` / date from `updated_at`, new session), library summary by status;
+- **header**: the session title and question count, or `Library` with document and page totals; rename and delete for the open session;
+- **chat** (`components/Chat.tsx`): each question is a heading and its answer sits below it (markdown, raw HTML skipped); under each answer one line lists `Skill <name>` per skill read this turn (from `read_skill_file` `tool_start` args, pre-reads included) and `Tool <name>` with running/✓/✗ per other tool call; the composer holds the textarea, the model picker (id + provider) and Send; hints for an empty library or an empty session;
+- **citations** (`lib/citations.ts: CITATION`, `parseCitations`): `(file.pdf, p. N)` in an answer, also with the filename in backticks and page lists or ranges (`p. 2, 3`, `pp. 4-6`), renders as a page chip (`Chat.tsx: markCitations` rewrites it into a `#cite` markdown link that the renderer draws as a chip);
+- **Sources** (`components/Sources.tsx`, `xl` and up, chat only): per cited document a strip of its pages with the cited ones filled (numbered tiles up to 12 pages, thin ticks up to 60, page list only beyond), the citation count and pages; ready documents not cited are listed under "Searched, not cited". Built from the answer text only; the passages themselves are not shown yet;
+- **Library** (`components/Library.tsx`): drop strip and file picker, multi-file; table with pages, added time (hidden on phones), status dot (Ready / Processing / Failed) and the error under a failed file; polls every 2 s while any document is `pending`; delete.
+
+Theme: all colours are CSS variables in `frontend/src/index.css` (shadcn token names, light in `:root`, dark in `.dark`, which `main.tsx` toggles from `prefers-color-scheme`). Palette is warm-grey neutrals with one indigo accent (`--primary`, also the focus ring); `--accent` is the tinted indigo surface for the active session and session hover; `--success` / `--warning` / `--destructive` colour document status. Corners are `--radius: 0.125rem` (2px), so every shadcn radius scales from it. The face is Albert Sans, loaded from Google Fonts in `frontend/index.html` with the system sans as fallback, so offline use falls back to the system face.
 
 Chat turns live in tab state, loaded from `GET /sessions/{id}/messages` the first time a session is opened in a page load, so a refresh keeps the conversation.
 
