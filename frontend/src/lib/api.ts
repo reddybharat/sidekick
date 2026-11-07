@@ -1,5 +1,7 @@
 // Hand-written mirror of the backend schemas (backend/app/api/schemas, domain/models.py).
 // shortcut: no codegen (openapi-typescript needs TypeScript 5); generate types if the API grows.
+import type { Turn } from '@/components/Chat'
+
 const API_URL: string = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 
 export interface Session {
@@ -59,6 +61,7 @@ export const api = {
   renameSession: (id: string, title: string) =>
     request<Session>(`/sessions/${id}`, json('PATCH', { title })),
   deleteSession: (id: string) => request<void>(`/sessions/${id}`, { method: 'DELETE' }),
+  listTurns: (id: string) => request<Turn[]>(`/sessions/${id}/messages`),
   // The first model is the backend's default.
   listModels: () => request<ModelInfo[]>('/models'),
   listDocuments: () => request<LibraryDocument[]>('/documents'),

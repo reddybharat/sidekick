@@ -1,3 +1,5 @@
+import asyncio
+import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -12,6 +14,12 @@ from app.container import Container
 from app.core.config import Settings
 from app.core.errors import register_error_handlers
 from app.core.logging import configure_logging
+
+if sys.platform == "win32":
+    # psycopg's async mode (the history checkpointer) cannot run on Windows' default Proactor loop.
+    # shortcut: uvicorn ignores this policy without --reload; asyncio policies are deprecated in
+    # Python 3.14, so switch to a loop_factory when the project moves there.
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 REQUEST_ID_HEADER = "X-Request-ID"
 MS_PER_S = 1000
@@ -34,7 +42,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        container = Container.build(settings)
+        container = await Container.build(settings)
         app.state.container = container
         try:
             yield

@@ -10,7 +10,7 @@ allowed-tools: retrieve_from_documents
 
 ## How to search
 1. Always search before answering, even if the topic seems general or familiar.
-2. Query with the question's key terms, not the whole sentence.
+2. Query with the question's key terms, not the whole sentence. Replace references to earlier turns with their names ("it" → "phase two budget").
 3. If the passages don't answer it, search once more with different words (synonyms, the likely section name).
 
 ## How to answer

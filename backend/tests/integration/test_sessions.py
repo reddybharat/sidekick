@@ -58,3 +58,14 @@ def test_rejects_blank_title_and_unknown_session(migrated_database_url: str) -> 
 
     assert blank.status_code == 422
     assert unknown.status_code == 404
+
+
+def test_history_is_empty_for_a_new_session_and_private_to_its_owner(
+    migrated_database_url: str,
+) -> None:
+    with _client(migrated_database_url, owner_id="alice") as alice:
+        session_id = alice.post("/sessions", json={}).json()["id"]
+        assert alice.get(f"/sessions/{session_id}/messages").json() == []
+
+    with _client(migrated_database_url, owner_id="bob") as bob:
+        assert bob.get(f"/sessions/{session_id}/messages").status_code == 404

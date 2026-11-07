@@ -124,3 +124,11 @@ async def test_read_skill_file_returns_the_file_or_lists_valid_paths() -> None:
 
     assert await read_skill_file.ainvoke({"path": RETRIEVING.path}) == RETRIEVING.text
     assert "Available:" in await read_skill_file.ainvoke({"path": "nope.md"})
+
+
+async def test_a_skill_read_in_an_earlier_turn_does_not_unlock_tools_now() -> None:
+    earlier_turn = [HumanMessage("q1"), _read(RETRIEVING.text), AIMessage("a1")]
+    state = {"messages": [*earlier_turn, HumanMessage("q2")]}
+
+    assert await _visible_tools(state) == [READ_SKILL_FILE]
+    assert await _visible_tools({"messages": [*state["messages"], _read(RETRIEVING.text)]}) == BOTH

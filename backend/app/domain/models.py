@@ -24,7 +24,7 @@ SESSION_TITLE_CHARS = 60  # titles taken from the first message
 
 
 class Session(BaseModel):
-    """A chat; each turn is answered on its own (no history) from the owner's document library."""
+    """A chat over the owner's document library; its history is checkpointed by session id."""
 
     model_config = ConfigDict(frozen=True, from_attributes=True)
 
@@ -33,6 +33,23 @@ class Session(BaseModel):
     title: str
     created_at: datetime
     updated_at: datetime
+
+
+class ToolStep(BaseModel):
+    id: str
+    name: str
+    ok: bool
+
+
+class HistoryTurn(BaseModel):
+    """One side of an exchange as the chat shows it; `error` is the saved reply of a failed turn."""
+
+    id: str
+    role: Literal["user", "assistant"]
+    text: str = ""
+    tools: list[ToolStep] = []
+    skills: list[str] = []
+    error: str | None = None
 
 
 class TurnUsage(BaseModel):

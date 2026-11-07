@@ -7,7 +7,7 @@ The design and why it is this way. What is implemented right now, file by file, 
 - **What:** chat with your PDFs. One agent on a Gemini free-tier or Groq model (chosen per message) answers from a per-owner document library in Postgres + pgvector and cites pages.
 - **Progressive disclosure:** the model starts with a small base system prompt and a one-line index of skills. It reads a skill (`read_skill_file`) before it can use the skill's tools.
 - **Layers:** `api → services → domain ← infra`, with `agent` depending only on domain ports. `container.py` is the only module that wires concrete classes.
-- **Stateless turns:** each question is answered on its own. No history reaches the model.
+- **Compact history:** a session's conversation is checkpointed in Postgres. The model sees only the last few earlier questions and answers plus the current turn, never old tool calls or passages.
 - **Library, not workspaces:** PDFs are ingested ahead of time, independent of any chat, and every session searches all of the owner's `ready` documents.
 
 ---
@@ -127,7 +127,7 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> Locked: tool registered at build
     Locked --> Unlocked: a skill listing it is read this turn
-    Unlocked --> [*]: turn ends (stateless)
+    Unlocked --> [*]: turn ends
 ```
 
 Locked tools are hidden from the model's tool schema, and a call to one is refused, in case the model names it anyway. Skills and tools are separate: a skill says how and when to use tools, a tool does I/O, and `allowed-tools` connects them by name. The format of a skill is fixed by [skill-template/SKILL.md](skill-template/SKILL.md).
@@ -198,6 +198,8 @@ erDiagram
 
 `documents` is unique on `(owner_id, sha256)`. `chunks.owner_id` is denormalised so every vector search filters by owner without a join. Sessions and documents are independent: deleting a session leaves the library untouched.
 
+Conversation history lives in the LangGraph checkpoint tables (`checkpoints`, `checkpoint_blobs`, `checkpoint_writes`), keyed by `thread_id` = the session id. The saver creates them itself at startup, so they are not in Alembic. Deleting a session deletes its thread first.
+
 ---
 
 ## Key decisions
@@ -208,7 +210,7 @@ erDiagram
 | D2 | The chat model is chosen per message from a catalog (`config/models.yaml`): Gemini free-tier models by default, Groq-hosted models (`qwen/qwen3.8-27b`) as the alternative. Embeddings and the document library stay local on Ollama and Postgres, so only the question and retrieved passages go to Google or Groq. A local 4B Ollama chat model was dropped: it was too weak to read a skill before searching |
 | D3 | PostgreSQL 18 + pgvector, native; HNSW cosine index; one embedding model per deployment, stored on each document and checked by `/ready` |
 | D4 | Progressive disclosure: base prompt + skill index → `SKILL.md` → tools. A tool is unlocked only by a read skill's `allowed-tools` |
-| D6 | Stateless single-turn queries. No checkpointer; history is a later enhancement |
+| D6 | Per-session history in a Postgres checkpointer (`thread_id` = session id); the full state is stored, but `ConversationView` shows the model only the last `history_max_turns` earlier questions and final answers plus the whole current turn. Old tool results never reach the model, a follow-up that needs document facts searches again, and switching models mid-session never replays one provider's tool calls to another. A failed turn is saved as an error reply that the model never sees |
 | D7 | One document library per owner instead of per-session workspaces (below) |
 | D8 | Chunks never cross a page, and retrieval context comes from the same page only, so every citation has one correct page |
 | D9 | The owner comes from the server and reaches tools through `AgentContext`, never through tool arguments or the model |
@@ -229,8 +231,8 @@ Planned enhancements and where each plugs in:
 |---|---|
 | MCP tools | MCP client tools passed to `build_agent` next to the local ones, unlocked by `allowed-tools` like any tool |
 | More skills | A new `agent/skills/<name>/SKILL.md` |
-| Follow-ups + history | Postgres checkpointer + summarization middleware in `build_agent` |
-| Human approval for tools | Human-in-the-loop middleware (needs the checkpointer) |
+| Longer memory than the last few turns | Summarization in `ConversationView` (older turns are forgotten today) |
+| Human approval for tools | Human-in-the-loop middleware (the checkpointer already exists) |
 | Long-term memory | Memory tools + a skill that lists them + a `memories` table |
 | Web search | Search tools + a skill that lists them |
 | Agent profiles, auto routing | Routing middleware choosing a model per call (today the user picks the model) |

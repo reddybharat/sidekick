@@ -61,10 +61,20 @@ export default function App() {
     return () => clearInterval(timer)
   }, [anyPending, refreshDocuments])
 
+  // Turns are loaded from the backend once per page load; after that this tab's state is current.
+  useEffect(() => {
+    if (!active || turns[active]) return
+    api
+      .listTurns(active)
+      .then((loaded) => setTurns((all) => ({ ...all, [active]: all[active] ?? loaded })))
+      .catch((e: unknown) => toast.error(errorText(e)))
+  }, [active, turns])
+
   async function newSession() {
     try {
       const s = await api.createSession()
       setSessions((list) => [s, ...list])
+      setTurns((all) => ({ ...all, [s.id]: [] }))
       setActive(s.id)
       setView('chat')
     } catch (e) {
