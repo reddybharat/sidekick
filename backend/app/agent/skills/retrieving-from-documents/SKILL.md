@@ -18,7 +18,7 @@ allowed-tools: retrieve_from_documents
 - Cite every fact as (filename, p. N) using the page in its header. Never guess a page.
 - Quote exactly only when the wording matters.
 - If passages disagree, report both with their citations.
-- Nothing relevant after two searches: say the documents don't contain the answer.
+- Nothing relevant after two searches: the documents don't contain the answer. Say so, then use another skill that can answer it.
 - Never mention tools, chunks or search.
 
 ## Examples

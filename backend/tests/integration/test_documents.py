@@ -115,6 +115,33 @@ def test_chat_answers_from_document_with_page_citation(
     assert events[-1][0] == "done"
 
 
+def test_a_question_the_documents_cannot_answer_goes_to_the_web_without_asking(
+    migrated_database_url: str, ollama_base_url: str, google_api_key: str
+) -> None:
+    settings = Settings(
+        database_url=migrated_database_url,
+        ollama_base_url=ollama_base_url,
+        google_api_key=google_api_key,
+        log_json=False,
+    )
+    with TestClient(create_app(settings)) as client:
+        client.post(
+            "/documents",
+            files={"file": ("sample.pdf", SAMPLE_PDF.read_bytes(), PDF_TYPE)},
+        )
+        session_id = client.post("/sessions", json={}).json()["id"]
+        response = client.post(
+            f"/sessions/{session_id}/messages",
+            json={"text": "Which books are similar to Atomic Habits by James Clear?"},
+        )
+
+    events = _events(response.text)
+    tool_starts = [data["name"] for name, data in events if name == "tool_start"]
+    assert "retrieve_from_documents" in tool_starts
+    assert "web_search" in tool_starts
+    assert events[-1][0] == "done"
+
+
 def test_search_finds_the_right_page_without_context_from_other_pages(
     migrated_database_url: str, ollama_base_url: str
 ) -> None:
