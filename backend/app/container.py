@@ -1,9 +1,13 @@
+import asyncio
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Self
 
 import httpx
+from langchain_core.callbacks import BaseCallbackHandler
+from langfuse import Langfuse
+from langfuse.langchain import CallbackHandler
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg import AsyncConnection
 from psycopg.rows import DictRow, dict_row
@@ -49,6 +53,7 @@ class Container:
     sessions: SessionService
     documents: DocumentService
     chat: ChatService
+    langfuse: Langfuse | None
 
     @classmethod
     async def build(cls, settings: Settings) -> Self:
@@ -104,6 +109,16 @@ class Container:
             )
             for spec in model_factory.specs
         }
+        langfuse = None
+        callbacks: list[BaseCallbackHandler] = []
+        if settings.langfuse_public_key and settings.langfuse_secret_key:
+            langfuse = Langfuse(
+                public_key=settings.langfuse_public_key,
+                secret_key=settings.langfuse_secret_key,
+                base_url=settings.langfuse_base_url,
+            )
+            # One handler for every turn: it keeps its state per LangChain run id.
+            callbacks.append(CallbackHandler(public_key=settings.langfuse_public_key))
         return cls(
             settings=settings,
             engine=engine,
@@ -115,10 +130,14 @@ class Container:
             embedder=embedder,
             sessions=sessions,
             documents=documents,
-            chat=ChatService(uow, agents, sessions, checkpointer),
+            chat=ChatService(uow, agents, sessions, checkpointer, callbacks),
+            langfuse=langfuse,
         )
 
     async def aclose(self) -> None:
+        if self.langfuse is not None:
+            # Flushes the traces still queued; a blocking network call.
+            await asyncio.to_thread(self.langfuse.shutdown)
         await self.ollama_http.aclose()
         await self.checkpoint_pool.close()
         await self.engine.dispose()

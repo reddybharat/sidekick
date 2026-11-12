@@ -35,6 +35,8 @@ Paths are relative to `backend/` unless they start with `frontend/`.
 | `MCP_SERVERS` | `{}` (startup then fails: the web and weather skills name tools no server provides) | MCP servers as a JSON map of name → streamable-HTTP URL; `.env.example` sets `search` and `weather` on custom-mcp-server (port 8001) |
 | `MCP_API_KEY` | unset | sent as `X-API-Key` to every MCP server; must equal custom-mcp-server's `MCP_API_KEY` |
 | `MCP_TIMEOUT_S` | `30.0` | MCP tool discovery at startup and each MCP tool call |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | unset → no tracing | both set → every chat turn is traced to Langfuse (§3.2) |
+| `LANGFUSE_BASE_URL` | `https://cloud.langfuse.com` | Langfuse region (`https://us.cloud.langfuse.com` for US projects) |
 
 The frontend reads `VITE_API_URL` (default `http://localhost:8000`) from `frontend/.env`.
 
@@ -55,6 +57,9 @@ CREATE EXTENSION vector;
 | `uv run pytest tests/unit -q` | nothing | skill loader, agent builder checks, progressive disclosure, conversation view, chunker, model factory |
 | `uv run pytest -rs` | Postgres (`TEST_DATABASE_URL`) + Ollama + custom-mcp-server (`MCP_SERVERS`); skips with a reason otherwise | everything: health/ready, models, sessions, documents + chat, logging, migrations, MCP tools |
 | `uv run pytest -rs tests/unit tests/integration/test_mcp.py` | custom-mcp-server for the live MCP test | unit tests plus MCP tool loading |
+| `uv run pytest -m eval -s` | everything `pytest -rs` needs + `GOOGLE_API_KEY`; Langfuse keys optional | answer-quality evals (§11.1); deselected by every other run (`addopts = -m 'not eval'`) because they spend model quota |
+
+Tests run with tracing off: the autouse fixture in `tests/conftest.py` blanks the Langfuse keys, and the `langfuse_tracing` fixture restores them for the tests that ask for it.
 
 Every integration test that starts the app (`create_app` in a `TestClient`) uses the `mcp_servers` fixture (`tests/conftest.py`), because the app does not start without its MCP servers. It skips when `MCP_SERVERS` is unset or a server does not answer HTTP.
 
@@ -116,10 +121,11 @@ build_agent(model_factory.model(id),   # one agent per catalog model
             load_skills(),                      agent/skills/
             [make_retrieve_from_documents(documents.search), *mcp_tools],
             the saver, HISTORY_MAX_TURNS)
-ChatService(uow, {model id: agent}, sessions, the saver)
+Langfuse(keys, LANGFUSE_BASE_URL) + CallbackHandler   # only with both Langfuse keys
+ChatService(uow, {model id: agent}, sessions, the saver, [the handler] or [])
 ```
 
-`Container.build` is async: it opens the pool and runs the saver's idempotent `setup()` (the checkpoint tables belong to the saver, not Alembic). `Container.aclose` closes the pool.
+`Container.build` is async: it opens the pool and runs the saver's idempotent `setup()` (the checkpoint tables belong to the saver, not Alembic). `Container.aclose` flushes queued Langfuse traces (`Langfuse.shutdown`) and closes the pool.
 
 4. The lifespan then calls `DocumentService.fail_interrupted`: ingestion runs in the API process, so a document still `pending` at startup was cut off by a restart. Every owner's `pending` rows become `failed` with `INTERRUPTED_MESSAGE` ("Processing was interrupted by a server restart. Upload the file again.") and `ingestion_interrupted` logs how many. This assumes one API process (a `shortcut:` in `main.py`).
 
@@ -134,7 +140,7 @@ Startup fails fast on an unreachable MCP server or one that lists no tools (`mcp
 `POST /sessions/{id}/messages {"text": "...", "model_id": "..."}` (`text` 1–8000 characters after trimming, otherwise 422; `model_id` optional, default = the catalog's first model, an id not in the catalog gives 422 `unknown_model` before the stream starts).
 
 1. The `get_session` dependency loads the session with the owner filter. An unknown session gives 404 **before** the stream starts.
-2. `services/chat.py: ChatService.stream` counts the earlier turns (`prior_turns`, logged in `turn_started`), then calls `agent.astream({"messages": [HumanMessage(text)]}, {"configurable": {"thread_id": session_id}}, stream_mode=["messages", "updates"], context=AgentContext(owner_id))`. The checkpointer appends the new message to the session's saved messages.
+2. `services/chat.py: ChatService.stream` counts the earlier turns (`prior_turns`, logged in `turn_started`), then calls `agent.astream({"messages": [HumanMessage(text)]}, {"configurable": {"thread_id": session_id}, "callbacks": the tracing handlers, "metadata": {"langfuse_session_id": session_id, "langfuse_user_id": owner_id}}, stream_mode=["messages", "updates"], context=AgentContext(owner_id))`. The checkpointer appends the new message to the session's saved messages.
 3. The agent loops: model call → tool calls → model call … until an answer or 8 tool calls.
 4. Stream mapping:
    - `messages` mode → `AIMessageChunk`s → one `token` event per non-empty `.text` (thinking never appears in `.text`). `usage_metadata` is summed over all model calls.
@@ -149,6 +155,10 @@ Startup fails fast on an unreachable MCP server or one that lists no tools (`mcp
 - `GET /sessions/{id}/messages` → `ChatService.history`: reads the session's checkpoint (`aget_state`) and returns `[{id, role, text, tools: [{id, name, ok, args}], skills, error?}]`, oldest first. One user entry per `HumanMessage`; one assistant entry per turn with the concatenated answer text, every tool call (`ok` false when the call has no result), the skills read (from `read_skill_file` paths) and, for a failed turn, `error` instead of text. The session is resolved first (404 for another owner's). No passages are returned.
 - `DELETE /sessions/{id}`: owner check → `ChatService.delete_history` (`adelete_thread`; 409 `conflict` "This chat is still answering. Try again when it finishes." while the session's lock is held, because the stream would keep writing to the deleted thread) → delete the session row. History goes first so a failure leaves the session in place and the delete can be retried; nothing is orphaned.
 - The frontend loads these turns once per page load when a session is first opened (`App.tsx`); after that its tab state is current.
+
+### 3.2 Tracing (Langfuse)
+
+With `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` set, `Container.build` creates a `langfuse.Langfuse` client and one `langfuse.langchain.CallbackHandler` (shared by every turn; it keeps its state per run id), and `ChatService.stream` passes it in the run config. Each turn becomes one Langfuse trace: the graph run with every model call (prompt, output, tokens), `read_skill_file` and tool call (arguments, results, including the retrieved passages), and failed turns with their error. The run metadata sets the trace's session (the chat session id) and user (the owner), so a chat's turns group under one Langfuse session. Traces carry full text, unlike logs (D12), and leave the machine for the configured Langfuse host. Spans are exported in the background; `Container.aclose` flushes them at shutdown. Without the keys nothing is created and turns run without callbacks.
 
 ### SSE events
 
@@ -420,11 +430,24 @@ Tests hit **real** Postgres (`TEST_DATABASE_URL`, truncated before each test) an
 | `tests/unit/test_conversation_view.py` | earlier turns shrink to question + answer, current turn whole, failed/unanswered turns hidden, only the last `history_max_turns` kept |
 | `tests/unit/test_chunkers.py`, `test_model_factory.py` | chunk packing/overlap; catalog validation: Gemini + Groq build, default = first, unregistered provider skipped, duplicate ids and unknown options rejected |
 | `tests/integration/test_documents.py` | upload validation, ingestion, delete cascade (chunks and the stored file), owner isolation, the original served back byte-for-byte (`has_file`, 404 for another owner and unknown ids), a pre-`0005` document without a file, startup failing an interrupted `pending` document and the re-upload replacing it, chat answer cites p. 3 via `retrieve_from_documents`, a question the PDF can't answer searched in the documents and then on the web without asking (model-dependent) |
-| `tests/integration/test_chat.py`, `test_sessions.py`, `test_models.py`, `test_health.py` | SSE turn + usage + first-message title, `model_id` default/selection/rejection, error event, failed turn saved as an error reply and removed with the session, a second send to a busy session rejected with `session_busy` and its history delete refused (rejected Groq key, no quota), follow-up resolved against the earlier turn (model-dependent), history empty and owner-private, session CRUD, `/models` with and without a key, live Gemini and Groq answers (skip without `GOOGLE_API_KEY` / `GROQ_API_KEY`), `/health` + `/ready` |
+| `tests/integration/test_chat.py`, `test_sessions.py`, `test_models.py`, `test_health.py` | SSE turn + usage + first-message title, a turn traced to Langfuse under its session and owner (rejected Groq key, no quota; skips without Langfuse keys), `model_id` default/selection/rejection, error event, failed turn saved as an error reply and removed with the session, a second send to a busy session rejected with `session_busy` and its history delete refused (rejected Groq key, no quota), follow-up resolved against the earlier turn (model-dependent), history empty and owner-private, session CRUD, `/models` with and without a key, live Gemini and Groq answers (skip without `GOOGLE_API_KEY` / `GROQ_API_KEY`), `/health` + `/ready` |
 | `tests/integration/test_logging.py` | key log events for ingestion and a chat turn |
 | `tests/integration/test_migrations.py` | upgrade → downgrade → upgrade over every revision, `0004` backfill and dedupe |
 
 The chat-with-document tests depend on model output and can fail intermittently.
+
+### 11.1 Evals (`tests/evals/test_answer_evals.py`)
+
+`uv run pytest -m eval -s` starts the app on the test database, uploads `sample.pdf`, and asks each question in `CASES` (one per page fact in the table above) in its own session on the default catalog model, through `ChatService.stream`. Each answer is scored without a judge model:
+
+| Score | Passes when |
+|---|---|
+| `searched` | `retrieve_from_documents` was called |
+| `fact_in_answer` | the expected fact is in the answer (lowercase, thousands separators removed) |
+| `cited_expected_page` | a `(sample.pdf, p. N)` citation names the expected page (same pattern as `frontend/src/lib/citations.ts`) |
+| `cited_only_expected_page` | every `sample.pdf` page cited is the expected one |
+
+`-s` prints the pass count per score; the test fails listing every (question, score) that failed. With Langfuse keys set, each score is also recorded on that question's Langfuse session (`Langfuse.create_score(session_id=…)`, boolean), next to the turn's trace. A run is 5 questions × about 3 model calls of the Gemini free-tier quota; results vary between runs.
 
 ---
 
@@ -449,4 +472,5 @@ The chat-with-document tests depend on model output and can fail intermittently.
 | MCP tools fixed at startup | restart the backend after custom-mcp-server adds, removes or renames a tool | servers change at runtime → reload tools per request |
 | Required MCP servers | the backend does not start without custom-mcp-server, and a server that dies later fails web and weather turns | MCP becomes optional → disable skills whose tools are missing |
 | Web text guarded by the prompt only | an instruction inside a web snippet is handled only by the "tool results are information" rule | web answers matter more → filter or quote snippets |
+| Deterministic evals only | 5 questions on one PDF; no judge for faithfulness or for declining off-topic questions, no Langfuse dataset runs | answer quality must be tracked across releases → Langfuse datasets + an LLM judge |
 | Model may skip retrieval on familiar topics | before the pre-read was removed, "Tell me about chain of thought prompting" answered "no information" without searching; not re-measured | still failing → force a first `retrieve_from_documents` call (`tool_choice`) |
