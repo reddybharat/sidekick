@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import uuid
 from collections.abc import Callable
 
@@ -75,6 +76,37 @@ def test_chat_emits_error_event_when_the_model_call_fails(
     assert response.status_code == 200
     assert [name for name, _ in _events(response.text)] == ["error"]
     assert run_sql(USAGE_SQL) == []
+
+
+TRACE_POLLS = 30
+TRACE_POLL_S = 1.0
+
+
+def test_a_chat_turn_is_traced_to_langfuse_under_its_session_and_owner(
+    migrated_database_url: str, langfuse_tracing: bool
+) -> None:
+    if not langfuse_tracing:
+        pytest.skip("LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY not set")
+    # The rejected Groq key fails the turn without spending quota; the failed run is still traced.
+    settings = Settings(
+        database_url=migrated_database_url, groq_api_key=REJECTED_GROQ_KEY, log_json=False
+    )
+    with TestClient(create_app(settings)) as client:
+        container: Container = client.app.state.container  # type: ignore[attr-defined]
+        langfuse = container.langfuse
+        assert langfuse is not None
+        session_id = client.post("/sessions", json={}).json()["id"]
+        client.post(f"/sessions/{session_id}/messages", json={"text": "Hello"})
+        langfuse.flush()
+        for _ in range(TRACE_POLLS):
+            observations = langfuse.api.observations.get_many(
+                session_id=session_id, user_id=settings.default_owner_id
+            ).data
+            if observations:
+                break
+            time.sleep(TRACE_POLL_S)
+
+    assert observations
 
 
 def test_chat_rejects_an_unknown_model_before_streaming(migrated_database_url: str) -> None:

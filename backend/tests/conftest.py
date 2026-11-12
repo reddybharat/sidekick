@@ -24,20 +24,39 @@ class _TestSettings(BaseSettings):
     google_api_key: str | None = None
     groq_api_key: str | None = None
     mcp_servers: dict[str, str] = {}
+    langfuse_public_key: str | None = None
+    langfuse_secret_key: str | None = None
 
 
 # Read once at import, before the autouse fixture below overrides the variables for every test.
 REAL_GOOGLE_API_KEY = _TestSettings().google_api_key
 REAL_GROQ_API_KEY = _TestSettings().groq_api_key
+REAL_LANGFUSE_KEYS = {
+    "LANGFUSE_PUBLIC_KEY": _TestSettings().langfuse_public_key,
+    "LANGFUSE_SECRET_KEY": _TestSettings().langfuse_secret_key,
+}
 FAKE_GROQ_API_KEY = "not-a-real-key"  # building a Groq client makes no network call
 
 
 @pytest.fixture(autouse=True)
 def _no_real_chat_keys_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Gemini is skipped and Groq gets a fake key, so the app starts with a Groq default model
-    and tests never spend quota or leave the machine unless they ask for a real key fixture."""
+    """Gemini is skipped, Groq gets a fake key and tracing is off, so the app starts with a Groq
+    default model and tests never spend quota or leave the machine unless they ask for a real key
+    fixture."""
     monkeypatch.setenv("GOOGLE_API_KEY", "")
     monkeypatch.setenv("GROQ_API_KEY", FAKE_GROQ_API_KEY)
+    for name in REAL_LANGFUSE_KEYS:
+        monkeypatch.setenv(name, "")
+
+
+@pytest.fixture
+def langfuse_tracing(monkeypatch: pytest.MonkeyPatch) -> bool:
+    """Turns Langfuse tracing back on when both keys are configured; False when they aren't."""
+    if not all(REAL_LANGFUSE_KEYS.values()):
+        return False
+    for name, value in REAL_LANGFUSE_KEYS.items():
+        monkeypatch.setenv(name, value or "")
+    return True
 
 
 @pytest.fixture

@@ -70,6 +70,10 @@ npm install
 ```
 In `backend/.env`, set your chat model key from step 6 and `MCP_API_KEY` (the same value as in custom-mcp-server's `.env`). Change `DATABASE_URL` if you used a different password in step 4.
 
+Optional tracing: create a free project at https://cloud.langfuse.com and set `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` in `backend/.env`. Every chat turn then shows up as a trace, including prompts and retrieved passages.
+
+Evals (answer quality on the sample PDF, spends model quota): `uv run pytest -m eval -s` in `backend/`.
+
 ## Run
 
 Start each in its own terminal, in this order:

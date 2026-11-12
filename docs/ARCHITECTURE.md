@@ -225,6 +225,7 @@ Conversation history lives in the LangGraph checkpoint tables (`checkpoints`, `c
 | D9 | The owner comes from the server and reaches tools through `AgentContext`, never through tool arguments or the model |
 | D10 | Logs carry ids, counts, sizes and durations, never message text, document content or file bytes |
 | D11 | The original PDF is kept in Postgres (`document_files`) and served inline (`GET /documents/{id}/file`), so a citation chip opens the browser's own PDF viewer at `#page=N` and every citation can be checked against its source |
+| D12 | Tracing is opt-in: only with Langfuse keys set does a LangChain callback send each turn's full trace (prompts, retrieved passages, tool results, answers) to Langfuse (Cloud by default; no Docker needed). Traces are a separate sink from logs, so D10 still holds for logs |
 
 ### D7: document library instead of per-session workspaces
 - **Context:** PDFs were first scoped to the session they were uploaded in. Everything is local, so ingesting once ahead of time is cheap, and the same PDF was being embedded again for every session.
@@ -245,7 +246,7 @@ Planned enhancements and where each plugs in:
 | Long-term memory | Memory tools + a skill that lists them + a `memories` table |
 | Agent profiles, auto routing | Routing middleware choosing a model per call (today the user picks the model) |
 | More chat providers | New provider registered in `ModelFactory` (Gemini and Groq were added) |
-| Tracing + evals | Langfuse callback handler; eval datasets |
+| Richer evals | Langfuse datasets and an LLM judge for faithfulness and off-topic declines (today: deterministic retrieval and citation scores, `tests/evals/`) |
 | Real auth | Replace `DEFAULT_OWNER_ID` with a resolved user in `api/deps.py` |
 | In-app viewer with passage highlight | Render the stored original (`GET /documents/{id}/file`) in the app and highlight the cited passage (today the browser viewer opens the page) |
 | Resume interrupted ingestion | At startup, re-run `DocumentService.ingest` for `pending` documents from `document_files` instead of marking them failed |

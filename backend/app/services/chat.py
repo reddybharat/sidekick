@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any, cast
 
 import structlog
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
@@ -49,6 +50,10 @@ SESSION_BUSY_MESSAGE = (
     "This chat is answering in another tab. Wait for it to finish, then send again."
 )
 SESSION_ANSWERING_MESSAGE = "This chat is still answering. Try again when it finishes."
+# Run metadata the Langfuse callback handler turns into the trace's session and user; inert
+# when tracing is off.
+TRACE_SESSION_KEY = "langfuse_session_id"
+TRACE_USER_KEY = "langfuse_user_id"
 
 
 class ChatService:
@@ -61,10 +66,12 @@ class ChatService:
         agents: Mapping[str, Agent],
         sessions: SessionService,
         checkpointer: BaseCheckpointSaver[Any],
+        callbacks: list[BaseCallbackHandler],
     ) -> None:
         self._uow = uow
         self._agents = agents
         self._checkpointer = checkpointer
+        self._callbacks = callbacks
         self._default_model_id = next(iter(agents))
         self._sessions = sessions
         # One turn at a time per session: concurrent turns would interleave on one checkpoint
@@ -129,7 +136,11 @@ class ChatService:
                 # which is where complete tool calls and tool results appear.
                 async for mode, payload in agent.astream(
                     {"messages": [HumanMessage(text)]},
-                    config,
+                    {
+                        **config,
+                        "callbacks": self._callbacks,
+                        "metadata": {TRACE_SESSION_KEY: sid, TRACE_USER_KEY: session.owner_id},
+                    },
                     stream_mode=["messages", "updates"],
                     context=AgentContext(owner_id=session.owner_id),
                 ):

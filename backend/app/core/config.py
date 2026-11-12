@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     mcp_servers: dict[str, str] = {}
     mcp_api_key: str | None = None
     mcp_timeout_s: float = 30.0
+    # Both keys set → every chat turn is traced to Langfuse with its full prompts, passages and
+    # answers (D12). Unset → no tracing.
+    langfuse_public_key: str | None = None
+    langfuse_secret_key: str | None = None
+    langfuse_base_url: str = "https://cloud.langfuse.com"
 
     @property
     def checkpoint_database_url(self) -> str:
